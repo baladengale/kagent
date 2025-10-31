@@ -21,6 +21,7 @@ from a2a.types import (
     TaskStatusUpdateEvent,
     TextPart,
 )
+from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
 from google.adk.utils.context_utils import Aclosing
 from opentelemetry import trace
@@ -32,7 +33,7 @@ from kagent.core.a2a import TaskResultAggregator, get_kagent_metadata_key
 from .converters.event_converter import convert_event_to_a2a_events
 from .converters.request_converter import convert_a2a_request_to_adk_run_args
 
-logger = logging.getLogger("google_adk." + __name__)
+logger = logging.getLogger("kagent_adk." + __name__)
 
 
 class A2aAgentExecutorConfig(BaseModel):
@@ -159,6 +160,21 @@ class A2aAgentExecutor(AgentExecutor):
         # ensure the session exists
         session = await self._prepare_session(context, run_args, runner)
 
+        # set request headers to session state
+        headers = context.call_context.state.get("headers", {})
+        state_changes = {
+            "headers": headers,
+        }
+
+        actions_with_update = EventActions(state_delta=state_changes)
+        system_event = Event(
+            invocation_id="header_update",
+            author="system",
+            actions=actions_with_update,
+        )
+
+        await runner.session_service.append_event(session, system_event)
+
         current_span = trace.get_current_span()
         if run_args["user_id"]:
             current_span.set_attribute("kagent.user_id", run_args["user_id"])
@@ -255,13 +271,28 @@ class A2aAgentExecutor(AgentExecutor):
             user_id=user_id,
             session_id=session_id,
         )
+
         if session is None:
+            # Extract session name from the first TextPart (like the UI does)
+            session_name = None
+            if context.message and context.message.parts:
+                for part in context.message.parts:
+                    # A2A parts have a .root property that contains the actual part (TextPart, FilePart, etc.)
+                    if isinstance(part, Part):
+                        root_part = part.root
+                        if isinstance(root_part, TextPart) and root_part.text:
+                            # Take first 20 chars + "..." if longer (matching UI behavior)
+                            text = root_part.text.strip()
+                            session_name = text[:20] + ("..." if len(text) > 20 else "")
+                            break
+
             session = await runner.session_service.create_session(
                 app_name=runner.app_name,
                 user_id=user_id,
-                state={},
+                state={"session_name": session_name},
                 session_id=session_id,
             )
+
             # Update run_args with the new session_id
             run_args["session_id"] = session.id
 

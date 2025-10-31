@@ -13,7 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kagent-dev/kagent/go/cli/internal/tui/theme"
-	"github.com/kagent-dev/kagent/go/internal/a2a"
+	"github.com/muesli/reflow/wordwrap"
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 )
 
@@ -33,6 +33,18 @@ type a2aEventMsg struct {
 }
 
 type streamDoneMsg struct{}
+
+type toolCall struct {
+	Name string      `json:"name"`
+	ID   string      `json:"id"`
+	Args interface{} `json:"args"`
+}
+
+type toolResult struct {
+	Name     string      `json:"name"`
+	ID       string      `json:"id"`
+	Response interface{} `json:"response"`
+}
 
 type chatModel struct {
 	agentRef  string
@@ -89,7 +101,7 @@ func newChatModel(agentRef string, sessionID string, send SendMessageFn, verbose
 }
 
 func (m *chatModel) Init() tea.Cmd {
-	return nil
+	return m.spin.Tick
 }
 
 func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -128,9 +140,16 @@ func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if vpHeight < 5 {
 			vpHeight = 5
 		}
+
+		oldWidth := m.vp.Width
 		m.vp.Width = msg.Width
 		m.vp.Height = vpHeight
 		m.input.SetWidth(msg.Width)
+
+		// Re-render content if width changed
+		if oldWidth != msg.Width && msg.Width > 0 {
+			m.vp.SetContent(m.history)
+		}
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -208,6 +227,7 @@ func (m *chatModel) submit(text string) tea.Cmd {
 
 	params := protocol.SendMessageParams{
 		Message: protocol.Message{
+			Kind:      protocol.KindMessage,
 			Role:      protocol.MessageRoleUser,
 			ContextID: &m.sessionID,
 			Parts:     []protocol.Part{protocol.NewTextPart(text)},
@@ -258,12 +278,8 @@ func (m *chatModel) appendEvent(ev protocol.StreamingMessageEvent) {
 			}
 		}
 		if res.Status.Message != nil {
-			if res.Final {
-				text := extractTextFromMessage(*res.Status.Message)
-				if strings.TrimSpace(text) != "" {
-					m.appendLine(theme.AgentStyle().Render("Agent:") + "\n" + text)
-				}
-			}
+			// Handle tool calls and results in the message
+			m.handleMessageParts(*res.Status.Message, res.Final)
 		}
 	case *protocol.TaskArtifactUpdateEvent:
 		// Render artifact content when the last chunk arrives
@@ -274,23 +290,13 @@ func (m *chatModel) appendEvent(ev protocol.StreamingMessageEvent) {
 			}
 		}
 	case *protocol.Message:
-		text := extractTextFromMessage(*res)
-		if strings.TrimSpace(text) != "" {
-			style := theme.UserStyle()
-			if res.Role == protocol.MessageRoleAgent {
-				style = theme.AgentStyle()
-			}
-			m.appendLine(style.Render(fmt.Sprintf("%s:", res.Role)) + "\n" + text)
-		}
+		m.handleMessageParts(*res, true)
 
 	case *protocol.Task:
 		// Show the last message in the task history
 		if len(res.History) > 0 {
 			last := res.History[len(res.History)-1]
-			text := extractTextFromMessage(last)
-			if strings.TrimSpace(text) != "" {
-				m.appendLine(theme.AgentStyle().Render("Agent:") + "\n" + text)
-			}
+			m.handleMessageParts(last, true)
 		}
 	default:
 		if m.verbose {
@@ -305,11 +311,127 @@ func (m *chatModel) appendError(err error) {
 	m.appendLine(theme.ErrorStyle().Render(fmt.Sprintf("Error: %v", err)))
 }
 
+// handleMessageParts processes a message and displays text, tool calls, and tool results
+func (m *chatModel) handleMessageParts(msg protocol.Message, shouldDisplay bool) {
+	var textParts []string
+	var toolCalls []toolCall
+	var toolResults []toolResult
+
+	// Process all parts
+	for _, part := range msg.Parts {
+		if tp, ok := part.(*protocol.TextPart); ok {
+			textParts = append(textParts, tp.Text)
+		} else if dp, ok := part.(*protocol.DataPart); ok {
+			// Debug: log what we're seeing
+			if m.verbose {
+				if metaJSON, err := json.Marshal(dp.Metadata); err == nil {
+					m.appendLine(theme.DimStyle().Render(fmt.Sprintf("DEBUG: DataPart metadata: %s", string(metaJSON))))
+				}
+				if dataJSON, err := json.Marshal(dp.Data); err == nil {
+					m.appendLine(theme.DimStyle().Render(fmt.Sprintf("DEBUG: DataPart data: %s", string(dataJSON))))
+				}
+			}
+
+			// Check if this is a tool call or tool result
+			if dp.Metadata == nil {
+				continue
+			}
+
+			kagentType, ok := dp.Metadata["kagent_type"].(string)
+			if !ok {
+				continue
+			}
+
+			dataMap, ok := dp.Data.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			switch kagentType {
+			case "function_call":
+				call := toolCall{
+					Name: getString(dataMap, "name"),
+					ID:   getString(dataMap, "id"),
+					Args: dataMap["args"],
+				}
+				toolCalls = append(toolCalls, call)
+			case "function_response":
+				result := toolResult{
+					Name:     getString(dataMap, "name"),
+					ID:       getString(dataMap, "id"),
+					Response: dataMap["response"],
+				}
+				toolResults = append(toolResults, result)
+			}
+		}
+	}
+
+	// Always display tool calls and results as they happen (even if not final)
+	// Display tool calls
+	for _, call := range toolCalls {
+		var argsStr string
+		if call.Args != nil {
+			if argsJSON, err := json.MarshalIndent(call.Args, "", "  "); err == nil {
+				argsStr = string(argsJSON)
+			} else {
+				argsStr = fmt.Sprintf("%v", call.Args)
+			}
+		}
+
+		display := theme.ToolCallStyle().Render(fmt.Sprintf("🔧 Tool Call: %s", call.Name))
+		if call.ID != "" {
+			display += theme.DimStyle().Render(fmt.Sprintf(" (id: %s)", call.ID))
+		}
+		if argsStr != "" {
+			display += "\n" + theme.DimStyle().Render(argsStr)
+		}
+		m.appendLine(display)
+	}
+
+	// Display tool results
+	for _, result := range toolResults {
+		var responseStr string
+		if result.Response != nil {
+			if respJSON, err := json.MarshalIndent(result.Response, "", "  "); err == nil {
+				responseStr = string(respJSON)
+			} else {
+				responseStr = fmt.Sprintf("%v", result.Response)
+			}
+		}
+
+		display := theme.ToolResultStyle().Render(fmt.Sprintf("📊 Tool Result: %s", result.Name))
+		if result.ID != "" {
+			display += theme.DimStyle().Render(fmt.Sprintf(" (id: %s)", result.ID))
+		}
+		if responseStr != "" {
+			display += "\n" + responseStr
+		}
+		m.appendLine(display)
+	}
+
+	// Display text content (only on final or if explicitly requested)
+	if shouldDisplay {
+		text := strings.Join(textParts, "")
+		if strings.TrimSpace(text) != "" {
+			style := theme.UserStyle()
+			if msg.Role == protocol.MessageRoleAgent {
+				style = theme.AgentStyle()
+			}
+			m.appendLine(style.Render(fmt.Sprintf("%s:", msg.Role)) + "\n" + text)
+		}
+	}
+}
+
 func (m *chatModel) appendLine(s string) {
+	wrapped := s
+	if m.vp.Width > 0 {
+		wrapped = wordwrap.String(s, m.vp.Width-2) // -2 for padding
+	}
+
 	if m.history == "" {
-		m.history = s
+		m.history = wrapped
 	} else {
-		m.history = m.history + "\n\n" + s
+		m.history = m.history + "\n\n" + wrapped
 	}
 	m.vp.SetContent(m.history)
 	m.vp.GotoBottom()
@@ -325,11 +447,6 @@ func (m *chatModel) ResetTranscript(title string) {
 // SetInputVisible toggles input visibility.
 func (m *chatModel) SetInputVisible(visible bool) {
 	m.showInput = visible
-}
-
-// extractTextFromMessage concatenates all text parts from a protocol.Message.
-func extractTextFromMessage(msg protocol.Message) string {
-	return a2a.ExtractText(msg)
 }
 
 // extractTextFromParts concatenates text from a slice of protocol.Part, stringifying non-text when reasonable.
@@ -388,4 +505,14 @@ func (m *chatModel) updateStatus() {
 	} else {
 		m.statusText = ""
 	}
+}
+
+// getString safely extracts a string value from a map
+func getString(m map[string]interface{}, key string) string {
+	if val, ok := m[key]; ok {
+		if str, ok := val.(string); ok {
+			return str
+		}
+	}
+	return ""
 }
