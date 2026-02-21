@@ -38,6 +38,7 @@ import (
 
 	"github.com/kagent-dev/kagent/go/internal/a2a"
 	"github.com/kagent-dev/kagent/go/internal/database"
+	"github.com/kagent-dev/kagent/go/internal/mcp"
 	versionmetrics "github.com/kagent-dev/kagent/go/internal/metrics"
 
 	"github.com/kagent-dev/kagent/go/internal/controller/reconciler"
@@ -51,6 +52,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/kagent-dev/kagent/go/pkg/auth"
+	dbpkg "github.com/kagent-dev/kagent/go/pkg/database"
 	"github.com/kagent-dev/kagent/go/pkg/mcp_translator"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -109,6 +111,9 @@ type Config struct {
 		InitialBufSize resource.QuantityValue `default:"4Ki"`
 		Timeout        time.Duration          `default:"60s"`
 	}
+	Proxy struct {
+		URL string
+	}
 	LeaderElection     bool
 	ProbeAddr          string
 	SecureMetrics      bool
@@ -158,6 +163,8 @@ func (cfg *Config) SetFlags(commandLine *flag.FlagSet) {
 	commandLine.Var(&cfg.Streaming.InitialBufSize, "streaming-initial-buf-size", "The initial size of the streaming buffer.")
 	commandLine.DurationVar(&cfg.Streaming.Timeout, "streaming-timeout", 60*time.Second, "The timeout for the streaming connection.")
 
+	commandLine.StringVar(&cfg.Proxy.URL, "proxy-url", "", "Proxy URL for internally-built k8s URLs (e.g., http://proxy.kagent.svc.cluster.local:8080)")
+
 	commandLine.StringVar(&agent_translator.DefaultImageConfig.Registry, "image-registry", agent_translator.DefaultImageConfig.Registry, "The registry to use for the image.")
 	commandLine.StringVar(&agent_translator.DefaultImageConfig.Tag, "image-tag", agent_translator.DefaultImageConfig.Tag, "The tag to use for the image.")
 	commandLine.StringVar(&agent_translator.DefaultImageConfig.PullPolicy, "image-pull-policy", agent_translator.DefaultImageConfig.PullPolicy, "The pull policy to use for the image.")
@@ -184,9 +191,10 @@ func LoadFromEnv(fs *flag.FlagSet) error {
 }
 
 type BootstrapConfig struct {
-	Ctx     context.Context
-	Manager manager.Manager
-	Router  *mux.Router
+	Ctx      context.Context
+	Manager  manager.Manager
+	Router   *mux.Router
+	DbClient dbpkg.Client
 }
 
 type CtrlManagerConfigFunc func(manager.Manager) error
@@ -359,9 +367,10 @@ func Start(getExtensionConfig GetExtensionConfig) {
 	dbClient := database.NewClient(dbManager)
 	router := mux.NewRouter()
 	extensionCfg, err := getExtensionConfig(BootstrapConfig{
-		Ctx:     ctx,
-		Manager: mgr,
-		Router:  router,
+		Ctx:      ctx,
+		Manager:  mgr,
+		Router:   router,
+		DbClient: dbClient,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to get start config")
@@ -372,6 +381,7 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		mgr.GetClient(),
 		cfg.DefaultModelConfig,
 		extensionCfg.AgentPlugins,
+		cfg.Proxy.URL,
 	)
 
 	rcnclr := reconciler.NewKagentReconciler(
@@ -379,6 +389,7 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		mgr.GetClient(),
 		dbClient,
 		cfg.DefaultModelConfig,
+		watchNamespacesList,
 	)
 
 	if err := (&controller.ServiceController{
@@ -414,6 +425,14 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		os.Exit(1)
 	}
 
+	if err = (&controller.ModelProviderConfigController{
+		Scheme:     mgr.GetScheme(),
+		Reconciler: rcnclr,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ModelProviderConfig")
+		os.Exit(1)
+	}
+
 	if err = (&controller.RemoteMCPServerController{
 		Scheme:     mgr.GetScheme(),
 		Reconciler: rcnclr,
@@ -441,6 +460,17 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		cfg.Streaming.Timeout,
 	)); err != nil {
 		setupLog.Error(err, "unable to set up a2a registrar")
+		os.Exit(1)
+	}
+
+	// Create MCP handler that bridges to A2A
+	mcpHandler, err := mcp.NewMCPHandler(
+		mgr.GetClient(),
+		cfg.A2ABaseUrl+httpserver.APIPathA2A,
+		extensionCfg.Authenticator,
+	)
+	if err != nil {
+		setupLog.Error(err, "unable to create MCP handler")
 		os.Exit(1)
 	}
 
@@ -480,10 +510,13 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		BindAddr:          cfg.HttpServerAddr,
 		KubeClient:        mgr.GetClient(),
 		A2AHandler:        a2aHandler,
+		MCPHandler:        mcpHandler,
 		WatchedNamespaces: watchNamespacesList,
 		DbClient:          dbClient,
 		Authorizer:        extensionCfg.Authorizer,
 		Authenticator:     extensionCfg.Authenticator,
+		ProxyURL:          cfg.Proxy.URL,
+		Reconciler:        rcnclr,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create HTTP server")

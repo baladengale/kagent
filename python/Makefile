@@ -19,7 +19,7 @@ lint:
 
 .PHONY: test
 test: update generate-test-certs
-	uv run pytest tests packages/*/tests
+	uv run pytest ./packages/**/tests/
 
 .PHONY: build
 build: update format
@@ -73,3 +73,7 @@ generate-test-certs:
 		rm -f server-extensions.conf server-req.pem && \
 		echo "Test certificates generated successfully"; \
 	fi
+	
+.PHONY: basic-openai-sample
+basic-openai-sample:
+	docker build . -f samples/openai/basic_agent/Dockerfile --tag localhost:5001/basic-openai:latest --push

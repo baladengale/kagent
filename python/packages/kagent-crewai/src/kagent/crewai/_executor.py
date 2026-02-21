@@ -1,7 +1,12 @@
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Union, override
+from typing import Any, Union
+
+try:
+    from typing import override  # Python 3.12+
+except ImportError:
+    from typing_extensions import override
 
 import httpx
 from a2a.server.agent_execution import AgentExecutor
@@ -23,7 +28,6 @@ from pydantic import BaseModel
 
 from crewai import Crew, Flow
 from crewai.memory import LongTermMemory
-
 from kagent.core.tracing._span_processor import (
     clear_kagent_span_attributes,
     set_kagent_span_attributes,

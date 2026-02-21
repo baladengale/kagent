@@ -7,8 +7,20 @@ within the A2A (Agent-to-Agent) protocol, converting graph events to A2A events.
 import asyncio
 import logging
 import uuid
-from datetime import UTC, datetime
-from typing import Any, override
+from datetime import datetime
+from typing import Any
+
+try:
+    from datetime import UTC  # Python 3.11+
+except ImportError:
+    from datetime import timezone
+
+    UTC = timezone.utc
+
+try:
+    from typing import override  # Python 3.12+
+except ImportError:
+    from typing_extensions import override
 
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
@@ -26,8 +38,6 @@ from a2a.types import (
     TextPart,
 )
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import Command
 from pydantic import BaseModel
 
 from kagent.core.a2a import (
@@ -43,6 +53,8 @@ from kagent.core.tracing._span_processor import (
     clear_kagent_span_attributes,
     set_kagent_span_attributes,
 )
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 
 from ._converters import _convert_langgraph_event_to_a2a
 from ._error_mappings import get_error_metadata, get_user_friendly_error_message

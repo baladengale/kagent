@@ -20,9 +20,13 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-from kagent.core.a2a import KAgentRequestContextBuilder, KAgentTaskStore
+from kagent.core.a2a import (
+    KAgentRequestContextBuilder,
+    KAgentTaskStore,
+    get_a2a_max_content_length,
+)
 
-from ._agent_executor import A2aAgentExecutor
+from ._agent_executor import A2aAgentExecutor, A2aAgentExecutorConfig
 from ._lifespan import LifespanManager
 from ._session_service import KAgentSessionService
 from ._token import KAgentTokenService
@@ -49,23 +53,37 @@ kagent_url_override = os.getenv("KAGENT_URL")
 class KAgentApp:
     def __init__(
         self,
-        root_agent: BaseAgent,
+        root_agent_factory: Callable[[], BaseAgent],
         agent_card: AgentCard,
         kagent_url: str,
         app_name: str,
         lifespan: Optional[Callable[[Any], Any]] = None,
         plugins: List[BasePlugin] = None,
+        stream: bool = False,
     ):
-        self.root_agent = root_agent
+        """Initialize the KAgent application.
+
+        Args:
+            root_agent_factory: Root agent factory function that returns a new agent instance
+            agent_card: Agent card configuration for A2A protocol
+            kagent_url: URL of the KAgent backend server
+            app_name: Application name for identification
+            lifespan: Optional lifespan function
+            plugins: Optional list of plugins
+            stream: Whether to stream the response
+        """
+        self.root_agent_factory = root_agent_factory
         self.kagent_url = kagent_url
         self.app_name = app_name
         self.agent_card = agent_card
         self._lifespan = lifespan
         self.plugins = plugins if plugins is not None else []
+        self.stream = stream
 
     def build(self, local=False) -> FastAPI:
         session_service = InMemorySessionService()
         token_service = None
+        http_client: Optional[httpx.AsyncClient] = None
         if not local:
             token_service = KAgentTokenService(self.app_name)
             http_client = httpx.AsyncClient(
@@ -75,22 +93,24 @@ class KAgentApp:
             )
             session_service = KAgentSessionService(http_client)
 
-        adk_app = App(name=self.app_name, root_agent=self.root_agent, plugins=self.plugins)
-
         def create_runner() -> Runner:
+            root_agent = self.root_agent_factory()
+            adk_app = App(name=self.app_name, root_agent=root_agent, plugins=self.plugins)
+
             return Runner(
                 app=adk_app,
                 session_service=session_service,
                 artifact_service=InMemoryArtifactService(),
             )
 
+        task_store: InMemoryTaskStore | KAgentTaskStore = InMemoryTaskStore()
+        if not local and http_client is not None:
+            task_store = KAgentTaskStore(http_client)
+
         agent_executor = A2aAgentExecutor(
             runner=create_runner,
+            config=A2aAgentExecutorConfig(stream=self.stream),
         )
-
-        task_store = InMemoryTaskStore()
-        if not local:
-            task_store = KAgentTaskStore(http_client)
 
         request_context_builder = KAgentRequestContextBuilder(task_store=task_store)
         request_handler = DefaultRequestHandler(
@@ -99,9 +119,11 @@ class KAgentApp:
             request_context_builder=request_context_builder,
         )
 
+        max_content_length = get_a2a_max_content_length()
         a2a_app = A2AFastAPIApplication(
             agent_card=self.agent_card,
             http_handler=request_handler,
+            max_content_length=max_content_length,
         )
 
         faulthandler.enable()
@@ -129,12 +151,8 @@ class KAgentApp:
             session_id=SESSION_ID,
             user_id=USER_ID,
         )
-        if isinstance(self.root_agent, Callable):
-            agent_factory = self.root_agent
-            root_agent = agent_factory()
-        else:
-            root_agent = self.root_agent
 
+        root_agent = self.root_agent_factory()
         runner = Runner(
             agent=root_agent,
             app_name=self.app_name,

@@ -1,3 +1,24 @@
+# Temporary: use apk to install krane
+# once https://github.com/wolfi-dev/os/pull/78579 is merged.
+### STAGE 0: build krane
+ARG BASE_IMAGE_REGISTRY=cgr.dev
+FROM $BASE_IMAGE_REGISTRY/chainguard/go:latest AS krane-builder
+
+ENV KRANE_VERSION=v0.20.7
+WORKDIR /build
+
+RUN git clone --depth 1 --branch $KRANE_VERSION \
+    https://github.com/google/go-containerregistry.git
+
+WORKDIR /build/go-containerregistry/cmd/krane
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /build/krane .
+    
 ### STAGE 1: base image
 ARG BASE_IMAGE_REGISTRY=cgr.dev
 FROM $BASE_IMAGE_REGISTRY/chainguard/wolfi-base:latest AS base-os
@@ -80,9 +101,9 @@ RUN --mount=type=cache,target=/root/.npm \
 ENV PATH="/opt/sandbox-runtime/node_modules/.bin:$PATH"
 
 # Install anthropic sandbox runtime and dependencies
-RUN --mount=type=cache,target=/var/cache/apk,rw \
-    apk add \
-    crane
+#RUN --mount=type=cache,target=/var/cache/apk,rw \
+#    apk add krane
+COPY --from=krane-builder --chown=1001:1001 /build/krane /usr/local/bin/krane
 
 USER python
 WORKDIR /.kagent
@@ -101,6 +122,9 @@ COPY --chown=python:pythongroup .python-version .
 COPY --chown=python:pythongroup uv.lock .
 COPY --chown=python:pythongroup packages/kagent-adk packages/kagent-adk
 COPY --chown=python:pythongroup packages/kagent-core packages/kagent-core
+COPY --chown=python:pythongroup packages/kagent-skills packages/kagent-skills
+COPY --chown=python:pythongroup packages/agentsts-adk packages/agentsts-adk
+COPY --chown=python:pythongroup packages/agentsts-core packages/agentsts-core
 COPY --chown=python:pythongroup README.md .
 
 ARG VERSION
@@ -114,6 +138,7 @@ RUN --mount=type=cache,target=/.kagent/cache,uid=1001,gid=1001                \
     && echo "Installation complete."
 
 # Create a separate venv for bash tool commands (sandbox environment)
+# This venv does not have pip installed
 RUN --mount=type=cache,target=/.kagent/cache,uid=1001,gid=1001                \
     echo "Creating bash tool sandbox environment..."                          \
     && mkdir -p /.kagent/sandbox-venv                                         \
@@ -122,7 +147,8 @@ RUN --mount=type=cache,target=/.kagent/cache,uid=1001,gid=1001                \
 
 ENV PATH="/.kagent/.venv/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv
-ENV BASH_VENV_PATH="/.kagent/sandbox-venv"
+ENV BASH_VENV_PATH=/.kagent/sandbox-venv
+ENV VIRTUAL_ENV=/.kagent/.venv
 
 WORKDIR /app
 

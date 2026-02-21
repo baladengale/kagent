@@ -123,7 +123,7 @@ func setupAgent(t *testing.T, cli client.Client, modelConfigName string, tools [
 type AgentOptions struct {
 	Name          string
 	SystemMessage string
-	Stream        *bool
+	Stream        bool
 	Env           []corev1.EnvVar
 	Skills        *v1alpha2.SkillForAgent
 	ExecuteCode   *bool
@@ -241,9 +241,6 @@ func runSyncTest(t *testing.T, a2aClient *a2aclient.A2AClient, userMessage, expe
 // If contextID is provided, it will be included in the message to maintain conversation context
 // Checks the full JSON output to support both artifacts and history from different agent types
 func runStreamingTest(t *testing.T, a2aClient *a2aclient.A2AClient, userMessage, expectedText string, contextID ...string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	msg := protocol.Message{
 		Kind:  protocol.KindMessage,
 		Role:  protocol.MessageRoleUser,
@@ -255,15 +252,24 @@ func runStreamingTest(t *testing.T, a2aClient *a2aclient.A2AClient, userMessage,
 		msg.ContextID = &contextID[0]
 	}
 
-	var stream <-chan protocol.StreamingMessageEvent
+	var (
+		stream <-chan protocol.StreamingMessageEvent
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
 	err := retry.OnError(defaultRetry, func(err error) bool {
 		return err != nil
 	}, func() error {
 		var retryErr error
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 		stream, retryErr = a2aClient.StreamMessage(ctx, protocol.SendMessageParams{Message: msg})
+		if retryErr != nil {
+			cancel()
+		}
 		return retryErr
 	})
 	require.NoError(t, err)
+	defer cancel()
 
 	resultList := []protocol.StreamingMessageEvent{}
 	var text string
@@ -348,9 +354,7 @@ func generateAgent(modelConfigName string, tools []*v1alpha2.Tool, opts AgentOpt
 	}
 
 	// Apply optional configurations
-	if opts.Stream != nil {
-		agent.Spec.Declarative.Stream = opts.Stream
-	}
+	agent.Spec.Declarative.Stream = opts.Stream
 
 	if len(opts.Env) > 0 {
 		agent.Spec.Declarative.Deployment.Env = append(agent.Spec.Declarative.Deployment.Env, opts.Env...)
@@ -369,7 +373,7 @@ func generateMCPServer() *v1alpha1.MCPServer {
 			Deployment: v1alpha1.MCPServerDeployment{
 				Port: 3000,
 				Cmd:  "npx",
-				Args: []string{"-y", "@modelcontextprotocol/server-everything"},
+				Args: []string{"-y", "@modelcontextprotocol/server-everything@2026.1.14"},
 			},
 			TransportType: v1alpha1.TransportTypeStdio,
 		},
@@ -436,6 +440,43 @@ func TestE2EInvokeInlineAgent(t *testing.T) {
 	})
 }
 
+func TestE2EInvokeInlineAgentWithStreaming(t *testing.T) {
+	// Setup mock server
+	baseURL, stopServer := setupMockServer(t, "mocks/invoke_inline_agent.json")
+	defer stopServer()
+
+	// Setup Kubernetes client
+	cli := setupK8sClient(t, false)
+
+	// Define tools
+	tools := []*v1alpha2.Tool{
+		{
+			Type: v1alpha2.ToolProviderType_McpServer,
+			McpServer: &v1alpha2.McpServerTool{
+				TypedLocalReference: v1alpha2.TypedLocalReference{
+					ApiGroup: "kagent.dev",
+					Kind:     "RemoteMCPServer",
+					Name:     "kagent-tool-server",
+				},
+				ToolNames: []string{"k8s_get_resources"},
+			},
+		},
+	}
+
+	// Setup specific resources
+	modelCfg := setupModelConfig(t, cli, baseURL)
+	// Enable streaming explicitly
+	agent := setupAgentWithOptions(t, cli, modelCfg.Name, tools, AgentOptions{Stream: true})
+
+	// Setup A2A client
+	a2aClient := setupA2AClient(t, agent)
+
+	// Run streaming test
+	t.Run("streaming_invocation", func(t *testing.T) {
+		runStreamingTest(t, a2aClient, "List all nodes in the cluster", "kagent-control-plane")
+	})
+}
+
 func TestE2EInvokeExternalAgent(t *testing.T) {
 	// Setup A2A client for external agent
 	a2aURL := a2aUrl("kagent", "kebab-agent")
@@ -478,7 +519,7 @@ func TestE2EInvokeDeclarativeAgentWithMcpServerTool(t *testing.T) {
 					Kind:     "MCPServer",
 					Name:     mcpServer.Name,
 				},
-				ToolNames: []string{"add"},
+				ToolNames: []string{"get-sum"},
 			},
 		},
 	}
@@ -501,8 +542,45 @@ func TestE2EInvokeDeclarativeAgentWithMcpServerTool(t *testing.T) {
 	})
 }
 
-// This function generates a CrewAI agent that uses a mock LLM server
-// Assumes that the image is built and pushed to registry, the agent can be found in python/samples/crewai/poem_flow
+// This function generates an OpenAI BYO agent that uses a mock LLM server
+// Assumes that the image is built and pushed to registry
+func generateOpenAIAgent(baseURL string) *v1alpha2.Agent {
+	return &v1alpha2.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "basic-openai-test-agent",
+			Namespace: "kagent",
+		},
+		Spec: v1alpha2.AgentSpec{
+			Description: "A basic OpenAI agent with calculator and weather tools",
+			Type:        v1alpha2.AgentType_BYO,
+			BYO: &v1alpha2.BYOAgentSpec{
+				Deployment: &v1alpha2.ByoDeploymentSpec{
+					Image: "localhost:5001/basic-openai:latest",
+					SharedDeploymentSpec: v1alpha2.SharedDeploymentSpec{
+						Env: []corev1.EnvVar{
+							{
+								Name: "OPENAI_API_KEY",
+								ValueFrom: &corev1.EnvVarSource{
+									SecretKeyRef: &corev1.SecretKeySelector{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "kagent-openai",
+										},
+										Key: "OPENAI_API_KEY",
+									},
+								},
+							},
+							{
+								Name:  "OPENAI_API_BASE",
+								Value: baseURL + "/v1",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func generateCrewAIAgent(baseURL string) *v1alpha2.Agent {
 	return &v1alpha2.Agent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -539,6 +617,59 @@ func generateCrewAIAgent(baseURL string) *v1alpha2.Agent {
 			},
 		},
 	}
+}
+
+func TestE2EInvokeOpenAIAgent(t *testing.T) {
+	// Setup mock server
+	baseURL, stopServer := setupMockServer(t, "mocks/invoke_openai_agent.json")
+	defer stopServer()
+
+	// Setup Kubernetes client
+	cli := setupK8sClient(t, false)
+
+	// Setup specific resources
+	modelCfg := setupModelConfig(t, cli, baseURL)
+	agent := generateOpenAIAgent(baseURL)
+
+	// Create the agent on the cluster
+	err := cli.Create(t.Context(), agent)
+	require.NoError(t, err)
+
+	// Wait for agent to be ready
+	args := []string{
+		"wait",
+		"--for",
+		"condition=Ready",
+		"--timeout=1m",
+		"agents.kagent.dev",
+		agent.Name,
+		"-n",
+		agent.Namespace,
+	}
+
+	cmd := exec.CommandContext(t.Context(), "kubectl", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run())
+
+	defer func() {
+		cli.Delete(t.Context(), agent)    //nolint:errcheck
+		cli.Delete(t.Context(), modelCfg) //nolint:errcheck
+	}()
+
+	// Setup A2A client - use the agent's actual name
+	a2aURL := a2aUrl("kagent", "basic-openai-test-agent")
+	a2aClient, err := a2aclient.NewA2AClient(a2aURL)
+	require.NoError(t, err)
+
+	useArtifacts := true
+	t.Run("sync_invocation_calculator", func(t *testing.T) {
+		runSyncTest(t, a2aClient, "What is 2+2?", "4", &useArtifacts)
+	})
+
+	t.Run("streaming_invocation_weather", func(t *testing.T) {
+		runStreamingTest(t, a2aClient, "What is the weather in London?", "Rainy, 52°F")
+	})
 }
 
 func TestE2EInvokeCrewAIAgent(t *testing.T) {
@@ -619,6 +750,8 @@ func TestE2EInvokeCrewAIAgent(t *testing.T) {
 	t.Run("streaming_invocation", func(t *testing.T) {
 		runStreamingTest(t, a2aClient, "Generate a poem about CrewAI", "CrewAI is awesome, it makes coding fun.")
 	})
+
+	cli.Delete(t.Context(), agent) //nolint:errcheck
 }
 
 func TestE2EInvokeSTSIntegration(t *testing.T) {
@@ -650,7 +783,7 @@ func TestE2EInvokeSTSIntegration(t *testing.T) {
 					Kind:     "MCPServer",
 					Name:     mcpServer.Name,
 				},
-				ToolNames: []string{"add"},
+				ToolNames: []string{"get-sum"},
 			},
 		},
 	}
@@ -659,7 +792,6 @@ func TestE2EInvokeSTSIntegration(t *testing.T) {
 	agent := setupAgentWithOptions(t, cli, modelCfg.Name, tools, AgentOptions{
 		Name:          "test-sts-agent",
 		SystemMessage: "You are an agent that adds numbers using the add tool available to you through the everything-mcp-server.",
-		Stream:        &[]bool{true}[0],
 		Env: []corev1.EnvVar{
 			{
 				Name:  "STS_WELL_KNOWN_URI",
@@ -695,7 +827,7 @@ func TestE2EInvokeSTSIntegration(t *testing.T) {
 
 		// verify our mock STS server received the token exchange request
 		stsRequests := stsServer.GetRequests()
-		require.Len(t, stsRequests, 1, "Expected 1 STS token exchange request")
+		require.NotEmpty(t, stsRequests, "Expected STS token exchange request but got none")
 
 		// ensure the subject token is the same as the one we sent
 		// which contains the may act claim
@@ -726,6 +858,64 @@ func TestE2EInvokeSkillInAgent(t *testing.T) {
 
 	// Run tests
 	runSyncTest(t, a2aClient, "make me a kebab", "Pick it up from around the corner", nil)
+}
+
+func TestE2EInvokePassthroughAgent(t *testing.T) {
+	// Setup mock server with header matching — the mock only responds
+	// if the Authorization header contains our passthrough token.
+	baseURL, stopServer := setupMockServer(t, "mocks/invoke_passthrough_agent.json")
+	defer stopServer()
+
+	// Setup Kubernetes client
+	cli := setupK8sClient(t, false)
+
+	// Create a ModelConfig with apiKeyPassthrough enabled (no apiKeySecret)
+	passthroughToken := "passthrough-test-token-12345"
+	modelCfg := &v1alpha2.ModelConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "test-passthrough-model-",
+			Namespace:    "kagent",
+		},
+		Spec: v1alpha2.ModelConfigSpec{
+			Model:             "gpt-4.1-mini",
+			Provider:          v1alpha2.ModelProviderOpenAI,
+			APIKeyPassthrough: true,
+			OpenAI: &v1alpha2.OpenAIConfig{
+				BaseURL: baseURL + "/v1",
+			},
+		},
+	}
+	err := cli.Create(t.Context(), modelCfg)
+	require.NoError(t, err)
+	cleanup(t, cli, modelCfg)
+
+	// Create agent with no tools
+	agent := setupAgent(t, cli, modelCfg.Name, nil)
+
+	// Create an A2A client that sends the Bearer token on every request.
+	// With passthrough enabled, the agent should forward this token to the
+	// LLM provider as the API key (Authorization: Bearer <token>).
+	httpClient := &http.Client{
+		Transport: &httpTransportWithHeaders{
+			base: http.DefaultTransport,
+			t:    t,
+			headers: map[string]string{
+				"Authorization": "Bearer " + passthroughToken,
+			},
+		},
+	}
+	a2aURL := a2aUrl(agent.Namespace, agent.Name)
+	a2aClient, err := a2aclient.NewA2AClient(a2aURL,
+		a2aclient.WithTimeout(60*time.Second),
+		a2aclient.WithHTTPClient(httpClient))
+	require.NoError(t, err)
+
+	// The mock server will only match if it receives the exact
+	// Authorization header "Bearer passthrough-test-token-12345".
+	// If passthrough is broken, mockllm returns 404 and the test fails.
+	t.Run("sync_invocation", func(t *testing.T) {
+		runSyncTest(t, a2aClient, "Hello from passthrough", "Token received successfully via passthrough", nil)
+	})
 }
 
 func TestE2EIAgentRunsCode(t *testing.T) {

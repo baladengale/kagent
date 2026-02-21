@@ -58,6 +58,53 @@ def generate_content_response():
 
 
 @pytest.fixture
+def generate_streaming_content_response():
+    """Generates a mock OpenAI streaming response matching generate_content_response."""
+    content = "Hi! How can I help you today?"
+
+    class MockDelta:
+        role = "assistant"
+        tool_calls = None
+        function_call = None
+        content = ""
+
+        def __init__(self, text):
+            if text is not None:
+                self.content = text
+
+    class MockChunkChoice:
+        finish_reason = None
+        index = 0
+        delta = None
+
+        def __init__(self, text, reason=None):
+            self.delta = MockDelta(text)
+            if reason:
+                self.finish_reason = reason
+
+    class MockChunk:
+        id = "chatcmpl-testid"
+        created = 1234567890
+        model = "gpt-3.5-turbo"
+        object = "chat.completion.chunk"
+        usage = None
+
+        def __init__(self, text=None, finish_reason=None):
+            self.choices = [MockChunkChoice(text, finish_reason)]
+
+    # Split content into chunks
+    chunks = []
+    # Chunk 1: "Hi! How can "
+    chunks.append(MockChunk(text=content[:12]))
+    # Chunk 2: "I help you today?"
+    chunks.append(MockChunk(text=content[12:]))
+    # Chunk 3: finish
+    chunks.append(MockChunk(finish_reason="stop"))
+
+    return chunks
+
+
+@pytest.fixture
 def generate_llm_response():
     return LlmResponse.create(
         types.GenerateContentResponse(
@@ -336,6 +383,143 @@ async def test_generate_content_async_with_max_tokens(llm_request, generate_cont
         mock_client.chat.completions.create.assert_called_once()
         _, kwargs = mock_client.chat.completions.create.call_args
         assert kwargs["max_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_streaming_vs_non_streaming_equivalence(
+    openai_llm, llm_request, generate_content_response, generate_streaming_content_response
+):
+    """Test that streaming and non-streaming responses produce equivalent content."""
+
+    expected_content = "Hi! How can I help you today?"
+
+    # 1. Non-streaming call
+    with mock.patch.object(openai_llm, "_client") as mock_client:
+
+        async def mock_non_stream(*args, **kwargs):
+            return generate_content_response
+
+        mock_client.chat.completions.create.side_effect = None
+        mock_client.chat.completions.create.return_value = mock_non_stream()
+
+        non_stream_results = [resp async for resp in openai_llm.generate_content_async(llm_request, stream=False)]
+        assert len(non_stream_results) == 1
+        non_stream_text = non_stream_results[0].content.parts[0].text
+        assert non_stream_text == expected_content
+
+    # 2. Streaming call
+    with mock.patch.object(openai_llm, "_client") as mock_client:
+
+        async def mock_stream_gen_func(*args, **kwargs):
+            async def gen():
+                for chunk in generate_streaming_content_response:
+                    yield chunk
+
+            return gen()
+
+        mock_client.chat.completions.create.return_value = None
+        mock_client.chat.completions.create.side_effect = mock_stream_gen_func
+
+        stream_results = [resp async for resp in openai_llm.generate_content_async(llm_request, stream=True)]
+
+        # Get the final response (where partial=False)
+        final_stream_response = stream_results[-1]
+        assert final_stream_response.partial is False
+        stream_text = final_stream_response.content.parts[0].text
+
+        assert non_stream_text == stream_text
+
+
+@pytest.mark.asyncio
+async def test_streaming_includes_stream_options_for_usage(
+    openai_llm, llm_request, generate_streaming_content_response
+):
+    """Test that streaming calls include stream_options to enable usage metadata.
+
+    OpenAI's streaming API does not return usage statistics by default.
+    The stream_options={"include_usage": True} parameter must be passed
+    to receive token usage data in the final chunk.
+    """
+    with mock.patch.object(openai_llm, "_client") as mock_client:
+
+        async def mock_stream_gen_func(*args, **kwargs):
+            # Verify that stream_options is passed with include_usage=True
+            assert "stream_options" in kwargs, "stream_options must be passed for streaming"
+            assert kwargs["stream_options"] == {"include_usage": True}, (
+                "stream_options must include include_usage=True to receive usage metadata"
+            )
+
+            async def gen():
+                for chunk in generate_streaming_content_response:
+                    yield chunk
+
+            return gen()
+
+        mock_client.chat.completions.create.side_effect = mock_stream_gen_func
+
+        # Execute streaming call - this should pass stream_options
+        stream_results = [resp async for resp in openai_llm.generate_content_async(llm_request, stream=True)]
+
+        # Verify the call was made
+        assert len(stream_results) > 0
+        mock_client.chat.completions.create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_streaming_usage_metadata_propagation(openai_llm, llm_request):
+    """Test that usage metadata from streaming response is properly propagated."""
+
+    class MockDelta:
+        role = "assistant"
+        tool_calls = None
+        content = "Hello"
+
+    class MockChunkChoice:
+        def __init__(self, finish_reason=None):
+            self.delta = MockDelta()
+            self.finish_reason = finish_reason
+            self.index = 0
+
+    class MockUsage:
+        prompt_tokens = 10
+        completion_tokens = 5
+        total_tokens = 15
+
+    class MockChunk:
+        id = "chatcmpl-test"
+        created = 1234567890
+        model = "gpt-3.5-turbo"
+        object = "chat.completion.chunk"
+
+        def __init__(self, finish_reason=None, include_usage=False):
+            self.choices = [MockChunkChoice(finish_reason)]
+            self.usage = MockUsage() if include_usage else None
+
+    with mock.patch.object(openai_llm, "_client") as mock_client:
+
+        async def mock_stream_gen_func(*args, **kwargs):
+            async def gen():
+                # First chunk with content
+                yield MockChunk()
+                # Final chunk with finish_reason and usage (when stream_options is set)
+                yield MockChunk(finish_reason="stop", include_usage=True)
+
+            return gen()
+
+        mock_client.chat.completions.create.side_effect = mock_stream_gen_func
+
+        stream_results = [resp async for resp in openai_llm.generate_content_async(llm_request, stream=True)]
+
+        # Get the final response
+        final_response = stream_results[-1]
+
+        # Verify usage metadata is present
+        assert final_response.usage_metadata is not None, (
+            "Usage metadata should be present when stream_options includes include_usage=True"
+        )
+        assert final_response.usage_metadata.prompt_token_count == 10
+        assert final_response.usage_metadata.candidates_token_count == 5
+        assert final_response.usage_metadata.total_token_count == 15
 
 
 # ============================================================================

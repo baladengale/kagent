@@ -16,7 +16,7 @@ from kagent.core import KAgentConfig, configure_logging, configure_tracing
 
 from . import AgentConfig, KAgentApp
 from .skill_fetcher import fetch_skill
-from .skills.skills_plugin import add_skills_tool_to_agent
+from .tools import add_skills_tool_to_agent
 
 logger = logging.getLogger(__name__)
 logging.getLogger("google_adk.google.adk.tools.base_authenticated_tool").setLevel(logging.ERROR)
@@ -27,6 +27,7 @@ app = typer.Typer()
 kagent_url_override = os.getenv("KAGENT_URL")
 sts_well_known_uri = os.getenv("STS_WELL_KNOWN_URI")
 propagate_token = os.getenv("KAGENT_PROPAGATE_TOKEN")
+uvicorn_log_level = os.getenv("UVICORN_LOG_LEVEL", os.getenv("LOG_LEVEL", "info")).lower()
 
 
 def create_sts_integration() -> Optional[ADKTokenPropagationPlugin]:
@@ -64,13 +65,32 @@ def static(
     sts_integration = create_sts_integration()
     if sts_integration:
         plugins = [sts_integration]
-    root_agent = agent_config.to_agent(app_cfg.name, sts_integration)
-    maybe_add_skills(root_agent)
 
-    kagent_app = KAgentApp(root_agent, agent_card, app_cfg.url, app_cfg.app_name, plugins=plugins)
+    if agent_config.model.api_key_passthrough:
+        from ._llm_passthrough_plugin import LLMPassthroughPlugin
+
+        if plugins is None:
+            plugins = []
+        plugins.append(LLMPassthroughPlugin())
+
+    def root_agent_factory() -> BaseAgent:
+        root_agent = agent_config.to_agent(app_cfg.name, sts_integration)
+
+        maybe_add_skills(root_agent)
+
+        return root_agent
+
+    kagent_app = KAgentApp(
+        root_agent_factory,
+        agent_card,
+        app_cfg.url,
+        app_cfg.app_name,
+        plugins=plugins,
+        stream=agent_config.stream if agent_config.stream is not None else False,
+    )
 
     server = kagent_app.build()
-    configure_tracing(server)
+    configure_tracing(app_cfg.name, app_cfg.namespace, server)
 
     uvicorn.run(
         server,
@@ -78,6 +98,7 @@ def static(
         port=port,
         workers=workers,
         reload=reload,
+        log_level=uvicorn_log_level,
     )
 
 
@@ -129,16 +150,32 @@ def run(
 ):
     app_cfg = KAgentConfig()
 
-    agent_loader = AgentLoader(agents_dir=working_dir)
-    root_agent = agent_loader.load_agent(name)
-
     plugins = None
     sts_integration = create_sts_integration()
     if sts_integration:
         plugins = [sts_integration]
-        add_to_agent(sts_integration, root_agent)
 
-    maybe_add_skills(root_agent)
+    agent_loader = AgentLoader(agents_dir=working_dir)
+
+    def root_agent_factory() -> BaseAgent:
+        root_agent = agent_loader.load_agent(name)
+
+        if sts_integration:
+            add_to_agent(sts_integration, root_agent)
+
+        maybe_add_skills(root_agent)
+
+        return root_agent
+
+    # Load agent config to get stream setting
+    agent_config = None
+    config_path = os.path.join(working_dir, name, "config.json")
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        agent_config = AgentConfig.model_validate(config)
+    except FileNotFoundError:
+        logger.debug(f"No config.json found at {config_path}, using defaults")
 
     with open(os.path.join(working_dir, name, "agent-card.json"), "r") as f:
         agent_card = json.load(f)
@@ -153,7 +190,15 @@ def run(
     except Exception:
         logger.exception(f"Failed to load agent module '{name}' for lifespan")
 
-    kagent_app = KAgentApp(root_agent, agent_card, app_cfg.url, app_cfg.app_name, lifespan=lifespan, plugins=plugins)
+    kagent_app = KAgentApp(
+        root_agent_factory,
+        agent_card,
+        app_cfg.url,
+        app_cfg.app_name,
+        lifespan=lifespan,
+        plugins=plugins,
+        stream=agent_config.stream if agent_config and agent_config.stream is not None else False,
+    )
 
     if local:
         logger.info("Running in local mode with InMemorySessionService")
@@ -161,13 +206,14 @@ def run(
     else:
         server = kagent_app.build()
 
-    configure_tracing(server)
+    configure_tracing(app_cfg.name, app_cfg.namespace, server)
 
     uvicorn.run(
         server,
         host=host,
         port=port,
         workers=workers,
+        log_level=uvicorn_log_level,
     )
 
 
@@ -177,9 +223,13 @@ async def test_agent(agent_config: AgentConfig, agent_card: AgentCard, task: str
     sts_integration = create_sts_integration()
     if sts_integration:
         plugins = [sts_integration]
-    root_agent = agent_config.to_agent(app_cfg.name, sts_integration)
-    maybe_add_skills(root_agent)
-    app = KAgentApp(root_agent, agent_card, app_cfg.url, app_cfg.app_name, plugins=plugins)
+
+    def root_agent_factory() -> BaseAgent:
+        root_agent = agent_config.to_agent(app_cfg.name, sts_integration)
+        maybe_add_skills(root_agent)
+        return root_agent
+
+    app = KAgentApp(root_agent_factory, agent_card, app_cfg.url, app_cfg.app_name, plugins=plugins)
     await app.test(task)
 
 

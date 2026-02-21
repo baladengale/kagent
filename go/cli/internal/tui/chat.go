@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kagent-dev/kagent/go/cli/internal/tui/theme"
+	"github.com/kagent-dev/kagent/go/pkg/utils"
 	"github.com/muesli/reflow/wordwrap"
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 )
@@ -334,7 +335,11 @@ func (m *chatModel) handleMessageParts(msg protocol.Message, shouldDisplay bool)
 				continue
 			}
 
-			kagentType, ok := dp.Metadata["kagent_type"].(string)
+			typeVal, found := utils.GetMetadataValue(dp.Metadata, "type")
+			if !found {
+				continue
+			}
+			kagentType, ok := typeVal.(string)
 			if !ok {
 				continue
 			}
