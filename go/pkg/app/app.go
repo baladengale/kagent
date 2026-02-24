@@ -253,6 +253,7 @@ func Start(getExtensionConfig GetExtensionConfig) {
 	var metricsCertWatcher, webhookCertWatcher *certwatcher.CertWatcher
 
 	ctrlmetrics.Registry.MustRegister(versionmetrics.NewBuildInfoCollector())
+	versionmetrics.RegisterAll(ctrlmetrics.Registry)
 
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:

@@ -10,10 +10,12 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	reconcilerutils "github.com/kagent-dev/kagent/go/internal/controller/reconciler/utils"
 	"github.com/kagent-dev/kagent/go/internal/controller/translator"
+	"github.com/kagent-dev/kagent/go/internal/metrics"
 	"github.com/kagent-dev/kmcp/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -81,6 +83,9 @@ func NewKagentReconciler(
 }
 
 func (a *kagentReconciler) ReconcileKagentAgent(ctx context.Context, req ctrl.Request) error {
+	start := time.Now()
+	controllerName := "agent"
+
 	// TODO(sbx0r): missing finalizer logic
 	agent := &v1alpha2.Agent{}
 	if err := a.kube.Get(ctx, req.NamespacedName, agent); err != nil {
@@ -88,14 +93,21 @@ func (a *kagentReconciler) ReconcileKagentAgent(ctx context.Context, req ctrl.Re
 			return a.handleAgentDeletion(req)
 		}
 
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to get agent %s: %w", req.NamespacedName, err)
 	}
 
 	err := a.reconcileAgent(ctx, agent)
 	if err != nil {
 		reconcileLog.Error(err, "failed to reconcile agent", "agent", req.NamespacedName)
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
+	} else {
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 	}
 
+	metrics.ReconcileDuration.WithLabelValues(controllerName).Observe(time.Since(start).Seconds())
 	return a.reconcileAgentStatus(ctx, agent, err)
 }
 
@@ -175,6 +187,12 @@ func (a *kagentReconciler) reconcileAgentStatus(ctx context.Context, agent *v1al
 }
 
 func (a *kagentReconciler) ReconcileKagentMCPService(ctx context.Context, req ctrl.Request) error {
+	start := time.Now()
+	controllerName := "mcp_service"
+	defer func() {
+		metrics.ReconcileDuration.WithLabelValues(controllerName).Observe(time.Since(start).Seconds())
+	}()
+
 	service := &corev1.Service{}
 	if err := a.kube.Get(ctx, req.NamespacedName, service); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -190,8 +208,11 @@ func (a *kagentReconciler) ReconcileKagentMCPService(ctx context.Context, req ct
 			if err := a.dbClient.DeleteToolsForServer(dbService.Name, dbService.GroupKind); err != nil {
 				reconcileLog.Error(err, "failed to delete tools for mcp service", "service", req.String())
 			}
+			metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 			return nil
 		}
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to get service %s: %w", req.Name, err)
 	}
 
@@ -206,15 +227,20 @@ func (a *kagentReconciler) ReconcileKagentMCPService(ctx context.Context, req ct
 	if err != nil {
 		// Return error - controller will handle validation vs transient error logic
 		reconcileLog.Error(err, "failed to convert service to remote mcp service", "service", utils.GetObjectRef(service))
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to convert service %s: %w", utils.GetObjectRef(service), err)
 	}
 
 	// Upsert tool server and fetch tools
 	if _, err := a.upsertToolServerForRemoteMCPServer(ctx, dbService, remoteService); err != nil {
 		reconcileLog.Error(err, "failed to upsert tool server for service", "service", utils.GetObjectRef(service))
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to upsert tool server for mcp service %s: %w", utils.GetObjectRef(service), err)
 	}
 
+	metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 	return nil
 }
 
@@ -224,12 +250,20 @@ type secretRef struct {
 }
 
 func (a *kagentReconciler) ReconcileKagentModelConfig(ctx context.Context, req ctrl.Request) error {
+	start := time.Now()
+	controllerName := "model_config"
+	defer func() {
+		metrics.ReconcileDuration.WithLabelValues(controllerName).Observe(time.Since(start).Seconds())
+	}()
+
 	modelConfig := &v1alpha2.ModelConfig{}
 	if err := a.kube.Get(ctx, req.NamespacedName, modelConfig); err != nil {
 		if apierrors.IsNotFound(err) {
+			metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 			return nil
 		}
-
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to get model %s: %w", req.Name, err)
 	}
 
@@ -268,6 +302,13 @@ func (a *kagentReconciler) ReconcileKagentModelConfig(ctx context.Context, req c
 
 	// compute the hash for the status
 	secretHash := computeStatusSecretHash(secrets)
+
+	if err != nil {
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
+	} else {
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
+	}
 
 	return a.reconcileModelConfigStatus(
 		ctx,
@@ -347,6 +388,12 @@ func (a *kagentReconciler) reconcileModelConfigStatus(ctx context.Context, model
 }
 
 func (a *kagentReconciler) ReconcileKagentMCPServer(ctx context.Context, req ctrl.Request) error {
+	start := time.Now()
+	controllerName := "mcp_server"
+	defer func() {
+		metrics.ReconcileDuration.WithLabelValues(controllerName).Observe(time.Since(start).Seconds())
+	}()
+
 	mcpServer := &v1alpha1.MCPServer{}
 	if err := a.kube.Get(ctx, req.NamespacedName, mcpServer); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -362,8 +409,11 @@ func (a *kagentReconciler) ReconcileKagentMCPServer(ctx context.Context, req ctr
 			if err := a.dbClient.DeleteToolsForServer(dbServer.Name, dbServer.GroupKind); err != nil {
 				reconcileLog.Error(err, "failed to delete tools for mcp server", "mcpServer", req.String())
 			}
+			metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 			return nil
 		}
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to get mcp server %s: %w", req.Name, err)
 	}
 
@@ -378,19 +428,30 @@ func (a *kagentReconciler) ReconcileKagentMCPServer(ctx context.Context, req ctr
 	if err != nil {
 		// Return error - controller will handle validation vs transient error logic
 		reconcileLog.Error(err, "failed to convert mcp server to remote mcp server", "mcpServer", utils.GetObjectRef(mcpServer))
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to convert mcp server %s: %w", utils.GetObjectRef(mcpServer), err)
 	}
 
 	// Upsert tool server and fetch tools
 	if _, err := a.upsertToolServerForRemoteMCPServer(ctx, dbServer, remoteSpec); err != nil {
 		reconcileLog.Error(err, "failed to upsert tool server for mcp server", "mcpServer", utils.GetObjectRef(mcpServer))
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to upsert tool server for remote mcp server %s: %w", utils.GetObjectRef(mcpServer), err)
 	}
 
+	metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 	return nil
 }
 
 func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, req ctrl.Request) error {
+	start := time.Now()
+	controllerName := "remote_mcp_server"
+	defer func() {
+		metrics.ReconcileDuration.WithLabelValues(controllerName).Observe(time.Since(start).Seconds())
+	}()
+
 	nns := req.NamespacedName
 	serverRef := nns.String()
 	l := reconcileLog.WithValues("remoteMCPServer", serverRef)
@@ -413,9 +474,12 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 				l.Error(err, "failed to delete tools for remote mcp server")
 			}
 
+			metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 			return nil
 		}
 
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return fmt.Errorf("failed to get remote mcp server %s: %w", serverRef, err)
 	}
 
@@ -428,6 +492,7 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 	tools, err := a.upsertToolServerForRemoteMCPServer(ctx, dbServer, server)
 	if err != nil {
 		l.Error(err, "failed to upsert tool server for remote mcp server")
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
 
 		// Fetch previously discovered tools from database if possible
 		var discoveryErr error
@@ -438,15 +503,21 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 	}
 
 	// update the tool server status as the agents depend on it
-	if err := a.reconcileRemoteMCPServerStatus(
+	if statusErr := a.reconcileRemoteMCPServerStatus(
 		ctx,
 		server,
 		tools,
 		err,
-	); err != nil {
-		return fmt.Errorf("failed to reconcile remote mcp server status %s: %w", req.NamespacedName, err)
+	); statusErr != nil {
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
+		return fmt.Errorf("failed to reconcile remote mcp server status %s: %w", req.NamespacedName, statusErr)
 	}
 
+	if err != nil {
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
+	} else {
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
+	}
 	return nil
 }
 
@@ -786,10 +857,15 @@ func (a *kagentReconciler) upsertToolServerForRemoteMCPServer(ctx context.Contex
 		return nil, fmt.Errorf("failed to create client for toolServer %s: %w", toolServer.Name, err)
 	}
 
+	discoveryStart := time.Now()
 	tools, err := a.listTools(ctx, tsp, toolServer)
+	metrics.ToolDiscoveryDuration.WithLabelValues(toolServer.Name).Observe(time.Since(discoveryStart).Seconds())
 	if err != nil {
+		metrics.ToolDiscoveryErrors.WithLabelValues(toolServer.Name).Inc()
 		return nil, fmt.Errorf("failed to fetch tools for toolServer %s: %w", toolServer.Name, err)
 	}
+
+	metrics.ManagedToolServers.Set(float64(len(tools)))
 
 	// Refresh tools in database - uses transaction for atomicity
 	if err := a.dbClient.RefreshToolsForServer(toolServer.Name, toolServer.GroupKind, tools...); err != nil {
@@ -916,11 +992,20 @@ func convertTool(tool *database.Tool) (*v1alpha2.MCPTool, error) {
 
 // ReconcileKagentModelProviderConfig reconciles a ModelProviderConfig object
 func (a *kagentReconciler) ReconcileKagentModelProviderConfig(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	start := time.Now()
+	controllerName := "model_provider_config"
+	defer func() {
+		metrics.ReconcileDuration.WithLabelValues(controllerName).Observe(time.Since(start).Seconds())
+	}()
+
 	mpc := &v1alpha2.ModelProviderConfig{}
 	if err := a.kube.Get(ctx, req.NamespacedName, mpc); err != nil {
 		if apierrors.IsNotFound(err) {
+			metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 			return ctrl.Result{}, nil // Deleted, cleanup done by OwnerReferences
 		}
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
 		return ctrl.Result{}, fmt.Errorf("failed to get model provider config %s: %w", req.NamespacedName, err)
 	}
 
@@ -935,6 +1020,13 @@ func (a *kagentReconciler) ReconcileKagentModelProviderConfig(ctx context.Contex
 	} else {
 		// Keep existing cached models
 		models = mpc.Status.DiscoveredModels
+	}
+
+	if secretErr != nil || discoveryErr != nil {
+		metrics.ReconcileErrors.WithLabelValues(controllerName).Inc()
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "error").Inc()
+	} else {
+		metrics.ReconcileTotal.WithLabelValues(controllerName, "success").Inc()
 	}
 
 	// Update status with results (status subresource only, no object modification)
