@@ -419,6 +419,11 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 		return fmt.Errorf("failed to get remote mcp server %s: %w", serverRef, err)
 	}
 
+	// Compute hash of all referenced secrets so we can detect token rotation.
+	// This is done before tool discovery so the hash reflects the current state
+	// even if discovery fails (e.g. temporary connectivity issue).
+	secretHash := a.computeRemoteMCPServerSecretHash(ctx, server)
+
 	dbServer := &database.ToolServer{
 		Name:        serverRef,
 		Description: server.Spec.Description,
@@ -443,6 +448,7 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 		server,
 		tools,
 		err,
+		secretHash,
 	); err != nil {
 		return fmt.Errorf("failed to reconcile remote mcp server status %s: %w", req.NamespacedName, err)
 	}
@@ -450,11 +456,34 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 	return nil
 }
 
+// computeRemoteMCPServerSecretHash computes a deterministic hash of all Kubernetes
+// Secrets referenced by the RemoteMCPServer's headersFrom field. This hash is stored
+// in the status and changes whenever a referenced secret is rotated, allowing the
+// Agent controller to detect the change (via its existing RemoteMCPServer watch) and
+// re-reconcile affected agents so they pick up the new token values.
+func (a *kagentReconciler) computeRemoteMCPServerSecretHash(ctx context.Context, server *v1alpha2.RemoteMCPServer) string {
+	var secrets []secretRef
+	for _, h := range server.Spec.HeadersFrom {
+		if h.ValueFrom == nil || h.ValueFrom.Type != v1alpha2.SecretValueSource {
+			continue
+		}
+		secret := &corev1.Secret{}
+		nn := types.NamespacedName{Namespace: server.Namespace, Name: h.ValueFrom.Name}
+		if err := a.kube.Get(ctx, nn, secret); err != nil {
+			reconcileLog.Error(err, "failed to get secret for hash computation, skipping", "secret", nn)
+			continue
+		}
+		secrets = append(secrets, secretRef{NamespacedName: nn, Secret: secret})
+	}
+	return computeStatusSecretHash(secrets)
+}
+
 func (a *kagentReconciler) reconcileRemoteMCPServerStatus(
 	ctx context.Context,
 	server *v1alpha2.RemoteMCPServer,
 	discoveredTools []*v1alpha2.MCPTool,
 	err error,
+	secretHash string,
 ) error {
 	var (
 		status  metav1.ConditionStatus
@@ -477,15 +506,19 @@ func (a *kagentReconciler) reconcileRemoteMCPServerStatus(
 		ObservedGeneration: server.Generation,
 	})
 
+	secretHashChanged := server.Status.SecretHash != secretHash
+
 	// only update if the status has changed to prevent looping the reconciler
 	if !conditionChanged &&
 		server.Status.ObservedGeneration == server.Generation &&
-		reflect.DeepEqual(server.Status.DiscoveredTools, discoveredTools) {
+		reflect.DeepEqual(server.Status.DiscoveredTools, discoveredTools) &&
+		!secretHashChanged {
 		return nil
 	}
 
 	server.Status.ObservedGeneration = server.Generation
 	server.Status.DiscoveredTools = discoveredTools
+	server.Status.SecretHash = secretHash
 
 	if err := a.kube.Status().Update(ctx, server); err != nil {
 		return fmt.Errorf("failed to update remote mcp server status: %w", err)

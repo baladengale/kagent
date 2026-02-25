@@ -85,6 +85,11 @@ type RemoteMCPServerStatus struct {
 	Conditions         []metav1.Condition `json:"conditions"`
 	// +kubebuilder:validation:Optional
 	DiscoveredTools []*MCPTool `json:"discoveredTools"`
+	// SecretHash is a hash of the secrets referenced by headersFrom, used to detect
+	// token/credential rotation. When this changes, agents using this RemoteMCPServer
+	// are re-reconciled so they pick up the new token values.
+	// +optional
+	SecretHash string `json:"secretHash,omitempty"`
 }
 
 type MCPTool struct {
