@@ -55,7 +55,8 @@ def static(
 ):
     app_cfg = KAgentConfig()
 
-    with open(os.path.join(filepath, "config.json"), "r") as f:
+    config_path = os.path.join(filepath, "config.json")
+    with open(config_path, "r") as f:
         config = json.load(f)
     agent_config = AgentConfig.model_validate(config)
     with open(os.path.join(filepath, "agent-card.json"), "r") as f:
@@ -74,7 +75,18 @@ def static(
         plugins.append(LLMPassthroughPlugin())
 
     def root_agent_factory() -> BaseAgent:
-        root_agent = agent_config.to_agent(app_cfg.name, sts_integration)
+        # Re-read config on every invocation so that credential updates in the
+        # mounted ConfigMap (e.g. rotated auth tokens from RemoteMCPServer
+        # headersFrom secrets) are picked up by new agent sessions without
+        # requiring a pod restart.
+        try:
+            with open(config_path, "r") as f:
+                fresh_config = AgentConfig.model_validate(json.load(f))
+        except (OSError, ValueError):
+            logger.exception("Failed to reload config from %s, using cached config", config_path)
+            fresh_config = agent_config
+
+        root_agent = fresh_config.to_agent(app_cfg.name, sts_integration)
 
         maybe_add_skills(root_agent)
 
