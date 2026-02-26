@@ -1089,9 +1089,13 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 	return nil, nil, nil, fmt.Errorf("unknown model provider: %s", model.Spec.Provider)
 }
 
-func (a *adkApiTranslator) translateStreamableHttpTool(ctx context.Context, server *v1alpha2.RemoteMCPServer, agentStaticHeaders, agentHeaderFiles map[string]string, proxyURL string) (*adk.StreamableHTTPConnectionParams, map[string]corev1.Volume, map[string]corev1.VolumeMount, error) {
-	// Split server-level headers into static values and volume-backed file refs.
-	staticHeaders, headerFiles, volumes, mounts := splitHeaderRefsWithVolumes(server.Namespace, server.Spec.HeadersFrom)
+func (a *adkApiTranslator) translateStreamableHttpTool(ctx context.Context, server *v1alpha2.RemoteMCPServer, agentNamespace string, agentStaticHeaders, agentHeaderFiles map[string]string, proxyURL string) (*adk.StreamableHTTPConnectionParams, map[string]corev1.Volume, map[string]corev1.VolumeMount, error) {
+	// Split server-level headers: same-namespace refs use volume mounts (dynamic);
+	// cross-namespace refs are resolved via K8s at reconciliation time (static).
+	staticHeaders, headerFiles, volumes, mounts, err := a.processServerHeaderRefs(ctx, agentNamespace, server)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
 	// Agent headers take precedence over server headers.
 	maps.Copy(staticHeaders, agentStaticHeaders)
@@ -1100,7 +1104,6 @@ func (a *adkApiTranslator) translateStreamableHttpTool(ctx context.Context, serv
 	// If proxy is configured, use proxy URL and set header for Gateway API routing
 	targetURL := server.Spec.URL
 	if proxyURL != "" {
-		var err error
 		targetURL, staticHeaders, err = applyProxyURL(targetURL, proxyURL, staticHeaders)
 		if err != nil {
 			return nil, nil, nil, err
@@ -1125,9 +1128,13 @@ func (a *adkApiTranslator) translateStreamableHttpTool(ctx context.Context, serv
 	return params, volumes, mounts, nil
 }
 
-func (a *adkApiTranslator) translateSseHttpTool(ctx context.Context, server *v1alpha2.RemoteMCPServer, agentStaticHeaders, agentHeaderFiles map[string]string, proxyURL string) (*adk.SseConnectionParams, map[string]corev1.Volume, map[string]corev1.VolumeMount, error) {
-	// Split server-level headers into static values and volume-backed file refs.
-	staticHeaders, headerFiles, volumes, mounts := splitHeaderRefsWithVolumes(server.Namespace, server.Spec.HeadersFrom)
+func (a *adkApiTranslator) translateSseHttpTool(ctx context.Context, server *v1alpha2.RemoteMCPServer, agentNamespace string, agentStaticHeaders, agentHeaderFiles map[string]string, proxyURL string) (*adk.SseConnectionParams, map[string]corev1.Volume, map[string]corev1.VolumeMount, error) {
+	// Split server-level headers: same-namespace refs use volume mounts (dynamic);
+	// cross-namespace refs are resolved via K8s at reconciliation time (static).
+	staticHeaders, headerFiles, volumes, mounts, err := a.processServerHeaderRefs(ctx, agentNamespace, server)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
 	// Agent headers take precedence over server headers.
 	maps.Copy(staticHeaders, agentStaticHeaders)
@@ -1136,7 +1143,6 @@ func (a *adkApiTranslator) translateSseHttpTool(ctx context.Context, server *v1a
 	// If proxy is configured, use proxy URL and set header for Gateway API routing
 	targetURL := server.Spec.URL
 	if proxyURL != "" {
-		var err error
 		targetURL, staticHeaders, err = applyProxyURL(targetURL, proxyURL, staticHeaders)
 		if err != nil {
 			return nil, nil, nil, err
@@ -1188,7 +1194,7 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 			return nil, nil, err
 		}
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentStaticHeaders, agentHeaderFiles, proxyURL)
+		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentNamespace, agentStaticHeaders, agentHeaderFiles, proxyURL)
 
 	case schema.GroupKind{
 		Group: "",
@@ -1214,7 +1220,7 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 			proxyURL = a.globalProxyURL
 		}
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentStaticHeaders, agentHeaderFiles, proxyURL)
+		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentNamespace, agentStaticHeaders, agentHeaderFiles, proxyURL)
 	case schema.GroupKind{
 		Group: "",
 		Kind:  "Service",
@@ -1237,16 +1243,16 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 			return nil, nil, err
 		}
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentStaticHeaders, agentHeaderFiles, proxyURL)
+		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentNamespace, agentStaticHeaders, agentHeaderFiles, proxyURL)
 	default:
 		return nil, nil, fmt.Errorf("unknown tool server type: %s", gvk)
 	}
 }
 
-func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, remoteMcpServer *v1alpha2.RemoteMCPServer, mcpServerTool *v1alpha2.McpServerTool, agentStaticHeaders, agentHeaderFiles map[string]string, proxyURL string) (map[string]corev1.Volume, map[string]corev1.VolumeMount, error) {
+func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, remoteMcpServer *v1alpha2.RemoteMCPServer, mcpServerTool *v1alpha2.McpServerTool, agentNamespace string, agentStaticHeaders, agentHeaderFiles map[string]string, proxyURL string) (map[string]corev1.Volume, map[string]corev1.VolumeMount, error) {
 	switch remoteMcpServer.Spec.Protocol {
 	case v1alpha2.RemoteMCPServerProtocolSse:
-		tool, volumes, mounts, err := a.translateSseHttpTool(ctx, remoteMcpServer, agentStaticHeaders, agentHeaderFiles, proxyURL)
+		tool, volumes, mounts, err := a.translateSseHttpTool(ctx, remoteMcpServer, agentNamespace, agentStaticHeaders, agentHeaderFiles, proxyURL)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1257,7 +1263,7 @@ func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, a
 		})
 		return volumes, mounts, nil
 	default:
-		tool, volumes, mounts, err := a.translateStreamableHttpTool(ctx, remoteMcpServer, agentStaticHeaders, agentHeaderFiles, proxyURL)
+		tool, volumes, mounts, err := a.translateStreamableHttpTool(ctx, remoteMcpServer, agentNamespace, agentStaticHeaders, agentHeaderFiles, proxyURL)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1377,6 +1383,57 @@ func (a *adkApiTranslator) runPlugins(ctx context.Context, agent *v1alpha2.Agent
 		}
 	}
 	return errs
+}
+
+// processServerHeaderRefs processes the HeadersFrom entries of a RemoteMCPServer.
+// For headers whose Secret/ConfigMap is in the same namespace as the agent pod,
+// volume mounts are used so Kubernetes can refresh the values automatically.
+// For cross-namespace references (Secret in server's namespace ≠ agent namespace),
+// the value is resolved via the K8s API at reconciliation time (static header).
+func (a *adkApiTranslator) processServerHeaderRefs(
+	ctx context.Context,
+	agentNamespace string,
+	server *v1alpha2.RemoteMCPServer,
+) (
+	staticHeaders map[string]string,
+	headerFiles map[string]string,
+	volumes map[string]corev1.Volume,
+	mounts map[string]corev1.VolumeMount,
+	err error,
+) {
+	staticHeaders = make(map[string]string)
+	headerFiles = make(map[string]string)
+	volumes = make(map[string]corev1.Volume)
+	mounts = make(map[string]corev1.VolumeMount)
+
+	for _, ref := range server.Spec.HeadersFrom {
+		switch {
+		case ref.ValueFrom != nil:
+			if server.Namespace == agentNamespace {
+				// Same namespace: use volume mount for automatic, zero-restart token refresh.
+				volName := mcpHeaderVolumeName(ref.ValueFrom.Type, ref.ValueFrom.Name)
+				mountPath := fmt.Sprintf("%s/%s", mcpHeadersMountBasePath, volName)
+				filePath := fmt.Sprintf("%s/%s", mountPath, ref.ValueFrom.Key)
+				headerFiles[ref.Name] = filePath
+				if _, exists := volumes[volName]; !exists {
+					volumes[volName], mounts[volName] = createMcpHeaderVolume(volName, mountPath, ref.ValueFrom)
+				}
+			} else {
+				// Cross-namespace: K8s does not allow mounting Secrets from a different namespace,
+				// so fall back to resolving the value at reconciliation time (static header).
+				value, resolveErr := ref.ValueFrom.Resolve(ctx, a.kube, server.Namespace)
+				if resolveErr != nil {
+					err = fmt.Errorf("failed to resolve cross-namespace header %s from namespace %s: %w",
+						ref.Name, server.Namespace, resolveErr)
+					return
+				}
+				staticHeaders[ref.Name] = value
+			}
+		case ref.Value != "":
+			staticHeaders[ref.Name] = ref.Value
+		}
+	}
+	return
 }
 
 // mcpHeadersMountBasePath is the base path inside the agent pod where Secret/ConfigMap
