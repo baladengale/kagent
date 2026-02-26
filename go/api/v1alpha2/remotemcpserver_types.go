@@ -85,6 +85,12 @@ type RemoteMCPServerStatus struct {
 	Conditions         []metav1.Condition `json:"conditions"`
 	// +kubebuilder:validation:Optional
 	DiscoveredTools []*MCPTool `json:"discoveredTools"`
+	// LastTokenRefreshTime records when the auth token was last successfully refreshed.
+	// +optional
+	LastTokenRefreshTime *metav1.Time `json:"lastTokenRefreshTime,omitempty"`
+	// TokenSecretHash records the hash of the last successfully resolved auth token secret.
+	// +optional
+	TokenSecretHash string `json:"tokenSecretHash,omitempty"`
 }
 
 type MCPTool struct {

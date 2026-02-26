@@ -23,11 +23,22 @@ import (
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	"github.com/kagent-dev/kagent/go/internal/controller/reconciler"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
+var (
+	remoteMCPServerControllerLog = ctrl.Log.WithName("remotemcpserver-controller")
 )
 
 // RemoteMCPServerController reconciles a RemoteMCPServer object
@@ -39,6 +50,7 @@ type RemoteMCPServerController struct {
 // +kubebuilder:rbac:groups=kagent.dev,resources=remotemcpservers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kagent.dev,resources=remotemcpservers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kagent.dev,resources=remotemcpservers/finalizers,verbs=update
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 
 func (r *RemoteMCPServerController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = log.FromContext(ctx)
@@ -61,6 +73,57 @@ func (r *RemoteMCPServerController) SetupWithManager(mgr ctrl.Manager) error {
 			NeedLeaderElection: ptr.To(true),
 		}).
 		For(&v1alpha2.RemoteMCPServer{}).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return r.findRemoteMCPServersReferencingSecret(ctx, mgr.GetClient(), types.NamespacedName{
+					Name:      obj.GetName(),
+					Namespace: obj.GetNamespace(),
+				})
+			}),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+		).
 		Named("remotemcpserver").
 		Complete(r)
+}
+
+func (r *RemoteMCPServerController) findRemoteMCPServersReferencingSecret(ctx context.Context, cl client.Client, secretObj types.NamespacedName) []reconcile.Request {
+	var serverList v1alpha2.RemoteMCPServerList
+	if err := cl.List(ctx, &serverList); err != nil {
+		remoteMCPServerControllerLog.Error(err, "failed to list RemoteMCPServers in order to reconcile Secret update")
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range serverList.Items {
+		server := &serverList.Items[i]
+		if remoteMCPServerReferencesSecret(server, secretObj) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      server.Name,
+					Namespace: server.Namespace,
+				},
+			})
+		}
+	}
+
+	return requests
+}
+
+func remoteMCPServerReferencesSecret(server *v1alpha2.RemoteMCPServer, secretObj types.NamespacedName) bool {
+	// secrets must be in the same namespace as the server
+	if server.Namespace != secretObj.Namespace {
+		return false
+	}
+
+	for _, h := range server.Spec.HeadersFrom {
+		if h.ValueFrom == nil {
+			continue
+		}
+		if h.ValueFrom.Type == v1alpha2.SecretValueSource && h.ValueFrom.Name == secretObj.Name {
+			return true
+		}
+	}
+
+	return false
 }

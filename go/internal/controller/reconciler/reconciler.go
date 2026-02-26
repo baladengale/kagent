@@ -277,6 +277,25 @@ func (a *kagentReconciler) ReconcileKagentModelConfig(ctx context.Context, req c
 	)
 }
 
+// computeHeadersHash computes a deterministic hash of the resolved header values.
+// This is used to track when auth tokens in RemoteMCPServer headersFrom secrets change.
+func computeHeadersHash(headers map[string]string) string {
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	hash := sha256.New()
+	for _, k := range keys {
+		hash.Write([]byte(k))
+		hash.Write([]byte{0}) // null-byte delimiter to prevent key/value boundary collisions
+		hash.Write([]byte(headers[k]))
+		hash.Write([]byte{0}) // null-byte delimiter to separate entries
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
 // computeStatusSecretHash computes a deterministic singular hash of the secrets the model config references for the status
 // this loses per-secret context (i.e. versioning/hash status per-secret), but simplifies the number of statuses tracked
 func computeStatusSecretHash(secrets []secretRef) string {
@@ -425,6 +444,15 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 		GroupKind:   server.GroupVersionKind().GroupKind().String(),
 	}
 
+	// Resolve headers to compute a hash for token refresh tracking.
+	// If header resolution fails, we still proceed with the upsert; the hash will be empty.
+	var headersHash string
+	if headers, hashErr := server.ResolveHeaders(ctx, a.kube); hashErr != nil {
+		l.Error(hashErr, "failed to resolve headers for token hash tracking")
+	} else {
+		headersHash = computeHeadersHash(headers)
+	}
+
 	tools, err := a.upsertToolServerForRemoteMCPServer(ctx, dbServer, server)
 	if err != nil {
 		l.Error(err, "failed to upsert tool server for remote mcp server")
@@ -443,6 +471,7 @@ func (a *kagentReconciler) ReconcileKagentRemoteMCPServer(ctx context.Context, r
 		server,
 		tools,
 		err,
+		headersHash,
 	); err != nil {
 		return fmt.Errorf("failed to reconcile remote mcp server status %s: %w", req.NamespacedName, err)
 	}
@@ -455,6 +484,7 @@ func (a *kagentReconciler) reconcileRemoteMCPServerStatus(
 	server *v1alpha2.RemoteMCPServer,
 	discoveredTools []*v1alpha2.MCPTool,
 	err error,
+	headersHash string,
 ) error {
 	var (
 		status  metav1.ConditionStatus
@@ -477,15 +507,24 @@ func (a *kagentReconciler) reconcileRemoteMCPServerStatus(
 		ObservedGeneration: server.Generation,
 	})
 
+	// Track whether the token secret hash has changed
+	tokenHashChanged := headersHash != "" && server.Status.TokenSecretHash != headersHash
+
 	// only update if the status has changed to prevent looping the reconciler
 	if !conditionChanged &&
 		server.Status.ObservedGeneration == server.Generation &&
-		reflect.DeepEqual(server.Status.DiscoveredTools, discoveredTools) {
+		reflect.DeepEqual(server.Status.DiscoveredTools, discoveredTools) &&
+		!tokenHashChanged {
 		return nil
 	}
 
 	server.Status.ObservedGeneration = server.Generation
 	server.Status.DiscoveredTools = discoveredTools
+	if tokenHashChanged {
+		server.Status.TokenSecretHash = headersHash
+		now := metav1.Now()
+		server.Status.LastTokenRefreshTime = &now
+	}
 
 	if err := a.kube.Status().Update(ctx, server); err != nil {
 		return fmt.Errorf("failed to update remote mcp server status: %w", err)

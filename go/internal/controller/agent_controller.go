@@ -119,6 +119,7 @@ func (r *AgentController) SetupWithManager(mgr ctrl.Manager) error {
 
 				return requests
 			}),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		Watches(
 			&corev1.Service{},
