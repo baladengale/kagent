@@ -10,6 +10,7 @@ import (
 type StreamableHTTPConnectionParams struct {
 	Url              string            `json:"url"`
 	Headers          map[string]string `json:"headers"`
+	HeaderFiles      map[string]string `json:"header_files,omitempty"`
 	Timeout          *float64          `json:"timeout,omitempty"`
 	SseReadTimeout   *float64          `json:"sse_read_timeout,omitempty"`
 	TerminateOnClose *bool             `json:"terminate_on_close,omitempty"`
@@ -24,6 +25,7 @@ type HttpMcpServerConfig struct {
 type SseConnectionParams struct {
 	Url            string            `json:"url"`
 	Headers        map[string]string `json:"headers"`
+	HeaderFiles    map[string]string `json:"header_files,omitempty"`
 	Timeout        *float64          `json:"timeout,omitempty"`
 	SseReadTimeout *float64          `json:"sse_read_timeout,omitempty"`
 }

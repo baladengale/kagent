@@ -22,9 +22,10 @@
     "http_tools": [
       {
         "params": {
-          "headers": {
-            "MATH": "sk-test-api-key"
+          "header_files": {
+            "MATH": "/var/run/mcp-headers/mcp-hdr-s-492f8e24/math"
           },
+          "headers": {},
           "sse_read_timeout": 300,
           "timeout": 30,
           "url": "http://localhost:8084/mcp"
@@ -71,7 +72,7 @@
       },
       "stringData": {
         "agent-card.json": "{\"name\":\"agent\",\"description\":\"\",\"url\":\"http://agent.test:8080\",\"version\":\"\",\"capabilities\":{\"streaming\":true,\"pushNotifications\":false,\"stateTransitionHistory\":true},\"defaultInputModes\":[\"text\"],\"defaultOutputModes\":[\"text\"],\"skills\":[]}",
-        "config.json": "{\"model\":{\"type\":\"openai\",\"model\":\"gpt-4o\",\"base_url\":\"\"},\"description\":\"\",\"instruction\":\"You are a math toolserver. Focus on solving mathematical problems step by step.\",\"http_tools\":[{\"params\":{\"url\":\"http://localhost:8084/mcp\",\"headers\":{\"MATH\":\"sk-test-api-key\"},\"timeout\":30,\"sse_read_timeout\":300},\"tools\":[\"k8s_get_resources\"]}],\"sse_tools\":null,\"remote_agents\":null,\"stream\":false}"
+        "config.json": "{\"model\":{\"type\":\"openai\",\"model\":\"gpt-4o\",\"base_url\":\"\"},\"description\":\"\",\"instruction\":\"You are a math toolserver. Focus on solving mathematical problems step by step.\",\"http_tools\":[{\"params\":{\"url\":\"http://localhost:8084/mcp\",\"headers\":{},\"header_files\":{\"MATH\":\"/var/run/mcp-headers/mcp-hdr-s-492f8e24/math\"},\"timeout\":30,\"sse_read_timeout\":300},\"tools\":[\"k8s_get_resources\"]}],\"sse_tools\":null,\"remote_agents\":null,\"stream\":false}"
       }
     },
     {
@@ -140,7 +141,7 @@
         "template": {
           "metadata": {
             "annotations": {
-              "kagent.dev/config-hash": "11246224890029939632"
+              "kagent.dev/config-hash": "13286202386655631021"
             },
             "labels": {
               "app": "kagent",
@@ -222,6 +223,11 @@
                     "name": "config"
                   },
                   {
+                    "mountPath": "/var/run/mcp-headers/mcp-hdr-s-492f8e24",
+                    "name": "mcp-hdr-s-492f8e24",
+                    "readOnly": true
+                  },
+                  {
                     "mountPath": "/var/run/secrets/tokens",
                     "name": "kagent-token"
                   }
@@ -234,6 +240,12 @@
                 "name": "config",
                 "secret": {
                   "secretName": "agent"
+                }
+              },
+              {
+                "name": "mcp-hdr-s-492f8e24",
+                "secret": {
+                  "secretName": "math-secret"
                 }
               },
               {
