@@ -30,6 +30,115 @@
 
 ---
 
+## 🚀 Platform Overview — kagent: AI Agent Platform for Kubernetes
+
+> **Internal Announcement** — We are excited to introduce **kagent** as our organization's standard platform for building, deploying, and managing AI agents at scale on Kubernetes.
+
+### What is kagent?
+
+**kagent** is a **Cloud Native, Kubernetes-native AI agent platform** that enables teams to build intelligent, autonomous AI agents and deploy them as first-class Kubernetes workloads. It bridges the power of large language models (LLMs) with the operational reliability of Kubernetes — making AI agents observable, scalable, and manageable using the same tools and workflows your teams already use.
+
+kagent is a **CNCF (Cloud Native Computing Foundation)** sandbox project, built on open standards and designed for enterprise production use.
+
+---
+
+### 🎯 Key Capabilities
+
+| Capability | Description |
+|---|---|
+| **Agent Lifecycle Management** | Define, deploy, update, and delete AI agents declaratively using Kubernetes CRDs (`Agent` resource). Full GitOps-compatible lifecycle. |
+| **Multi-LLM Provider Support** | Connect agents to OpenAI, Azure OpenAI, Anthropic Claude, Google Vertex AI, Ollama, or any OpenAI-compatible gateway (LiteLLM, AI Gateway). |
+| **MCP Tool Integration** | Agents connect to any **Model Context Protocol (MCP)** server to access tools. Built-in MCP servers cover Kubernetes, Istio, Helm, Argo CD, Prometheus, Grafana, Cilium, and more. |
+| **Remote MCP Servers** | Securely connect agents to external/remote MCP endpoints with token-based authentication and automatic secret-backed header management. |
+| **Multi-Agent Orchestration** | Agents can invoke other agents as sub-agents, enabling complex multi-step and multi-agent workflows (A2A protocol). |
+| **Long-Term Memory** | Agents can persist and recall information across sessions using configurable memory backends (e.g. Supabase). |
+| **Declarative Configuration** | All platform resources — agents, model configs, tool servers — are Kubernetes custom resources, fully declarative and YAML-driven. |
+| **Web UI** | A browser-based UI for creating, managing, and chatting with agents without writing code. |
+| **CLI** | A powerful `kagent` CLI for managing agents and tools from the terminal, available for Linux, macOS, and Windows. |
+| **Full Observability** | OpenTelemetry tracing built-in. Integrates with Prometheus, Grafana, Jaeger and any OTLP-compatible backend. |
+| **Skills & OCI Packaging** | Package reusable agent skills as OCI container images or Git repositories, and attach them to agents on demand. |
+| **PostgreSQL & SQLite Support** | Flexible database backend — use embedded SQLite for development or PostgreSQL for production-grade persistence. |
+| **API Key Passthrough** | Support for federated identity — forward Bearer tokens from incoming requests directly to LLM providers, eliminating separate secret management. |
+| **Security** | OpenSSF Best Practices certified. GitHub Advanced Security enabled. Apache 2.0 licensed. |
+
+---
+
+### 🏗️ Platform Architecture
+
+kagent consists of **4 core components** running in your Kubernetes cluster:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     kagent Platform                      │
+│                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  │
+│  │  Controller  │  │    Engine    │  │      UI       │  │
+│  │ (Go/K8s CRD) │  │ (Python ADK) │  │  (Next.js)    │  │
+│  └──────────────┘  └──────────────┘  └───────────────┘  │
+│         │                 │                  │           │
+│         └─────────────────┴──────────────────┘          │
+│                           │                              │
+│                    ┌──────────────┐                      │
+│                    │     CLI      │                      │
+│                    │  (Go/Multi)  │                      │
+│                    └──────────────┘                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+- **Controller** — Kubernetes controller watching `Agent`, `ModelConfig`, `ToolServer`, and `RemoteMCPServer` CRDs. Reconciles desired state continuously.
+- **Engine** — Python-based runtime (ADK) that executes agent logic, manages LLM calls, and handles MCP tool invocations.
+- **UI** — Web dashboard for no-code agent creation, management, and conversational interaction.
+- **CLI** — Terminal-based management tool for power users and CI/CD pipelines.
+
+---
+
+### 🔧 Agent Lifecycle
+
+```
+Define (YAML CRD)  →  Deploy (kubectl / Helm / GitOps)  →  Run (Engine)
+        ↓                                                        ↓
+  ModelConfig                                          MCP Tool Calls
+  ToolServers                                          LLM Inference
+  RemoteMCPServers                                     Sub-Agent Invocation
+        ↓                                                        ↓
+  Update (reconciled automatically)              Observe (OTel / Grafana)
+```
+
+---
+
+### 🔌 MCP Server Ecosystem
+
+kagent ships with a rich set of **built-in MCP tool servers** for cloud-native operations:
+
+| Domain | Tools Available |
+|---|---|
+| **Kubernetes** | Pods, Deployments, Services, ConfigMaps, Namespaces, Events, RBAC |
+| **Istio** | Traffic management, Service mesh observability, mTLS |
+| **Helm** | Chart install/upgrade/rollback, repo management |
+| **Argo CD** | Application sync, rollouts, health status |
+| **Prometheus** | Metric queries, alerting rules |
+| **Grafana** | Dashboard management, annotations |
+| **Cilium** | Network policies, endpoint visibility |
+| **Custom / Remote** | Connect any MCP-compatible server via `RemoteMCPServer` CRD |
+
+---
+
+### 📦 Installation
+
+kagent is deployed via **Helm** into any Kubernetes cluster:
+
+```bash
+helm install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent -n kagent --create-namespace
+```
+
+Supports Kind, GKE, EKS, AKS, and any CNCF-conformant Kubernetes distribution.
+
+---
+
+> 📖 **Full documentation:** [kagent.dev](https://kagent.dev) | 🐙 **Upstream project:** [github.com/kagent-dev/kagent](https://github.com/kagent-dev/kagent)
+
+---
+
 **kagent** is a Kubernetes native framework for building AI agents. Kubernetes is the most popular orchestration platform for running workloads, and **kagent** makes it easy to build, deploy and manage AI agents in Kubernetes. The **kagent** framework is designed to be easy to understand and use, and to provide a flexible and powerful way to build and manage AI agents.
 
 <div align="center">
