@@ -1,0 +1,19 @@
+# Failover health policy. Without this, backends are never evicted and failover
+# does NOT occur. This evicts a backend after 1 consecutive 5xx or rate-limit
+# (429) response, then routes traffic to the next priority group.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: llm-failover-health
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: llm-failover
+  backend:
+    health:
+      unhealthyCondition: "response.code >= 500 || response.code == 429"
+      eviction:
+        duration: 10s
+        consecutiveFailures: 1

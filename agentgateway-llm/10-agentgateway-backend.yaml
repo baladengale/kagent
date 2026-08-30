@@ -1,0 +1,46 @@
+# agentgateway LLM backend with priority-based failover.
+# Priority group 1 (active):   dola-seed-2.0-lite
+# Priority group 2 (fallback): glm-4.7 via Z.AI
+#
+# NOTE on the primary provider (PLEASE VERIFY):
+# `dola-seed-2.0-lite` could not be matched to any public provider catalog. The
+# host/path below assume ByteDance Volcengine ARK (OpenAI-compatible), because the
+# "seed" naming matches the Doubao-Seed family. If your model is served elsewhere,
+# update host / port / path (and possibly `model`) in the first provider block.
+# ARK may also require an endpoint ID (e.g. ep-xxxxxxxx) as the `model` value.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: llm-failover
+  namespace: agentgateway-system
+spec:
+  ai:
+    groups:
+      # --- Priority group 1 (highest): active model ---
+      - providers:
+          - name: dola-seed-primary
+            openai:
+              model: dola-seed-2.0-lite
+            host: ark.cn-beijing.volces.com
+            port: 443
+            path: /api/v3/chat/completions
+            policies:
+              auth:
+                secretRef:
+                  name: dola-ark-secret
+              tls:
+                sni: ark.cn-beijing.volces.com
+      # --- Priority group 2: fallback model ---
+      - providers:
+          - name: glm-4-7-fallback
+            openai:
+              model: glm-4.7
+            host: api.z.ai
+            port: 443
+            path: /api/paas/v4/chat/completions
+            policies:
+              auth:
+                secretRef:
+                  name: zai-secret
+              tls:
+                sni: api.z.ai

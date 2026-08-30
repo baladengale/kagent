@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git pull *)",
+      "Bash(curl -s https://api.github.com/repos/kagent-dev/kagent/releases/tags/v0.10.0-rc2)",
+      "Bash(grep -E '\\\\.tgz$')"
+    ]
+  }
+}
