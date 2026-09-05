@@ -95,10 +95,6 @@ database:
       minConns: null
       maxConnIdleTime: ""
       maxConnLifetime: ""
-    # -- Hard-delete idle sessions (and cascaded events/tasks/checkpoints/shares) after N days
-    # of no activity. Uses session.updated_at as a sliding idle clock (writes refresh it).
-    # 0 disables cleanup (default, existing installs unchanged).
-    sessionRetentionDays: 0
     # -- Bundled PostgreSQL instance — for development and evaluation only.
     # Not suitable for production. Deployed when enabled is true and url/urlFile are not set.
     bundled:
@@ -112,7 +108,7 @@ database:
         # -- Bundled PostgreSQL image name
         name: postgres
         # -- Bundled PostgreSQL image tag
-        tag: "18.3-alpine"
+        tag: "18.6-alpine3.23"
         # -- Bundled PostgreSQL image pull policy
         pullPolicy: IfNotPresent
       # -- PersistentVolumeClaim size for demo PostgreSQL data
@@ -187,9 +183,6 @@ controller:
     # JWT claim for user identity (default: "sub")
     # Override only if your OIDC provider uses a different claim
     userIdClaim: ""
-  # -- The base URL of the A2A Server endpoint, as advertised to clients.
-  # @default -- `http://<fullname>-controller.<namespace>.svc:<port>`
-  a2aBaseUrl: ""
   # -- Public gRPC URL advertised by AgentInstance Agent Cards.
   # @default -- `http://<fullname>-controller.<namespace>.svc:<grpc-port>`
   a2aGatewayUrl: ""
@@ -324,16 +317,12 @@ controller:
   # Extra controller env (mapped to flags via SUBSTRATE_* env names).
   env: []
 
-  # Agent Substrate (OpenClaw harness runtime=substrate). Requires ate-system installed.
-  # kagent generates per-harness ActorTemplates and references an existing WorkerPool.
+  # Agent Substrate. Requires ate-system installed. kagent creates ate-api
+  # ActorTemplates and references an existing Kubernetes WorkerPool.
   substrate:
     enabled: false
     ateApiEndpoint: ""
     atenetRouterURL: ""
-    # Substrate ate-api-server identity for env source resolution (secretKeyRef/configMapKeyRef on ActorTemplates).
-    ateApiServer:
-      namespace: ate-system
-      serviceAccount: ate-api-server
     defaultWorkerPool:
       namespace: ""
       name: ""
@@ -371,12 +360,12 @@ controller:
   readinessProbe: {}
 
 # -- Optional Agent Substrate WorkerPool installed by this chart. This is platform
-# capacity and is not owned by individual AgentHarness resources.
+# capacity and is not owned by individual agents.
 substrateWorkerPool:
   create: false
   name: kagent-default
   replicas: 1
-  ateomImage: ""
+  workerImage: ""
   # sandboxClass selects the sandbox runtime family (gvisor|microvm). kagent-generated
   # ActorTemplates currently hardcode gvisor; set this to gvisor until microvm is supported.
   sandboxClass: gvisor
@@ -799,6 +788,9 @@ oauth2-proxy:
   # Cluster-specific OIDC settings - override these per deployment
   # These are set as env vars and referenced in args for easy patching
   extraEnv:
+    # Forces a rollout whenever the sign_in.html ConfigMap's content changes.
+    - name: KAGENT_OAUTH2_PROXY_SIGNIN_TEMPLATE_CHECKSUM
+      value: '{{ include "kagent.oauth2ProxySignInHTML" . | sha256sum }}'
     - name: OIDC_ISSUER_URL
       value: ""
     - name: OIDC_REDIRECT_URL
@@ -833,7 +825,7 @@ oauth2-proxy:
     # /assets/ with env-config.js ahead of it, so all three have to be reachable
     # unauthenticated or the branded login page renders blank. The Next.js paths
     # this replaces (_next/static, _next/image, login-bg) no longer exist.
-    skip-auth-regex: "^/(login|assets/|env-config\\.js|logo-.*\\.png|favicon\\.ico|api/agentharnesses/.*/gateway).*$"
+    skip-auth-regex: "^/(login|assets/|env-config\\.js|logo-.*\\.png|favicon\\.ico).*$"
     # Use custom templates that redirect to kagent's branded /login page
     custom-templates-dir: "/templates"
 

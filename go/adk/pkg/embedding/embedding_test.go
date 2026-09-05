@@ -9,11 +9,24 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-logr/logr"
+	"log/slog"
+
 	"github.com/kagent-dev/kagent/go/adk/pkg/auth"
 	"github.com/kagent-dev/kagent/go/adk/pkg/models"
 	"github.com/kagent-dev/kagent/go/api/adk"
 )
+
+func TestEmbeddingHTTPClientTLS(t *testing.T) {
+	insecure := true
+	client, err := embeddingHTTPClient(&adk.EmbeddingConfig{TLSInsecureSkipVerify: &insecure})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("transport TLS config = %#v", client.Transport)
+	}
+}
 
 func TestOpenAIProvider_UsesAPIKeyNotKagentToken(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "sk-openai-key")
@@ -157,7 +170,7 @@ func TestNormalizeL2(t *testing.T) {
 }
 
 func TestProcessEmbeddings_RejectsUndersized(t *testing.T) {
-	_, err := processEmbeddings(logr.Discard(), [][]float32{{1, 2, 3}}, "test")
+	_, err := processEmbeddings(slog.New(slog.DiscardHandler), [][]float32{{1, 2, 3}}, "test")
 	if err == nil {
 		t.Fatal("expected error for undersized embedding")
 	}

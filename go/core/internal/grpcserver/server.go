@@ -15,8 +15,8 @@ import (
 	dbpkg "github.com/kagent-dev/kagent/go/api/database"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
-	agentservice "github.com/kagent-dev/kagent/go/core/internal/service/agent"
-	feedbackservice "github.com/kagent-dev/kagent/go/core/internal/service/feedback"
+	"github.com/kagent-dev/kagent/go/core/internal/service/agentinstance"
+	"github.com/kagent-dev/kagent/go/core/internal/service/checkpoint"
 	"github.com/kagent-dev/kagent/go/core/internal/service/kubecrud"
 	memoryservice "github.com/kagent-dev/kagent/go/core/internal/service/memory"
 	modelservice "github.com/kagent-dev/kagent/go/core/internal/service/model"
@@ -24,8 +24,7 @@ import (
 	systemservice "github.com/kagent-dev/kagent/go/core/internal/service/system"
 	toolservice "github.com/kagent-dev/kagent/go/core/internal/service/tool"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
-	"github.com/kagent-dev/kagent/go/core/v2/agentinstance"
-	"github.com/kagent-dev/kagent/go/core/v2/checkpoint"
+	"github.com/kagent-dev/kagent/go/pkg/logging"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -33,7 +32,6 @@ import (
 	"google.golang.org/grpc/health"
 	grpc_health_v1 "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
-	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -51,20 +49,21 @@ type Config struct {
 	Authenticator         auth.AuthProvider
 	ShareStore            ShareStore
 	Registerer            prometheus.Registerer
-	AgentService          *agentservice.Service
 	AgentTemplateService  *kubecrud.Service[*v1alpha3.AgentTemplate, *v1alpha3.AgentTemplateList]
 	HarnessService        *kubecrud.Service[*v1alpha3.Harness, *v1alpha3.HarnessList]
 	ModelService          *modelservice.Service
 	ToolService           *toolservice.Service
 	PromptTemplateService *prompttemplateservice.Service
 	SystemService         *systemservice.Service
-	FeedbackService       *feedbackservice.Service
 	MemoryService         *memoryservice.Service
 	AgentInstanceService  *agentinstance.Service
 	CheckpointService     *checkpoint.Service
 	A2AHandler            a2asrv.RequestHandler
-	MethodPolicies        MethodPolicies
-	Listener              net.Listener
+	// RegisterServices registers services core does not own. Called during New,
+	// because gRPC requires every service to be registered before Serve.
+	RegisterServices func(grpc.ServiceRegistrar)
+	MethodPolicies   MethodPolicies
+	Listener         net.Listener
 }
 
 type Server struct {
@@ -81,7 +80,7 @@ func New(config Config) (*Server, error) {
 		config.MaxMessageBytes = DefaultMaxMessageSize
 	}
 	if config.SystemService == nil {
-		config.SystemService = systemservice.NewService()
+		return nil, fmt.Errorf("system service is required")
 	}
 	if config.MethodPolicies == nil {
 		config.MethodPolicies = DefaultMethodPolicies()
@@ -129,15 +128,9 @@ func New(config Config) (*Server, error) {
 	healthServer := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 	apiv1alpha1.RegisterSystemServiceServer(grpcServer, newSystemServer(config.SystemService))
-	if config.AgentService != nil {
-		apiv1alpha1.RegisterAgentServiceServer(grpcServer, newAgentServer(config.AgentService, config.MaxMessageBytes))
-	}
 	if config.AgentTemplateService != nil {
 		apiv1alpha1.RegisterAgentTemplateServiceServer(grpcServer, newAgentTemplateServer(config.AgentTemplateService, config.MaxMessageBytes))
 	}
-	// Registered separately from AgentService on purpose: this serves the
-	// Harness CRD that AgentInstance pairs with an AgentTemplate, not the
-	// AgentHarness CRD that AgentService's *AgentHarness RPCs serve.
 	if config.HarnessService != nil {
 		apiv1alpha1.RegisterHarnessServiceServer(grpcServer, newHarnessServer(config.HarnessService, config.MaxMessageBytes))
 	}
@@ -150,20 +143,22 @@ func New(config Config) (*Server, error) {
 	if config.PromptTemplateService != nil {
 		apiv1alpha1.RegisterPromptTemplateServiceServer(grpcServer, newPromptTemplateServer(config.PromptTemplateService))
 	}
-	if config.FeedbackService != nil {
-		apiv1alpha1.RegisterFeedbackServiceServer(grpcServer, newFeedbackServer(config.FeedbackService))
-	}
 	if config.MemoryService != nil {
 		apiv1alpha1.RegisterMemoryServiceServer(grpcServer, newMemoryServer(config.MemoryService))
 	}
 	if config.AgentInstanceService != nil {
-		agentinstance.RegisterGRPC(grpcServer, config.AgentInstanceService)
+		apiv1alpha1.RegisterAgentInstanceServiceServer(grpcServer, &agentInstanceServer{service: config.AgentInstanceService})
 	}
 	if config.CheckpointService != nil {
-		checkpoint.RegisterGRPC(grpcServer, config.CheckpointService)
+		apiv1alpha1.RegisterCheckpointServiceServer(grpcServer, &checkpointServer{service: config.CheckpointService})
 	}
 	if config.A2AHandler != nil {
 		a2agrpc.NewHandler(config.A2AHandler).RegisterWith(grpcServer)
+	}
+	// After core's own, so reflection sees them and a consumer registering a
+	// duplicate service name panics here rather than silently taking over.
+	if config.RegisterServices != nil {
+		config.RegisterServices(grpcServer)
 	}
 	if config.Reflection {
 		reflection.Register(grpcServer)
@@ -190,8 +185,8 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	log := ctrllog.FromContext(ctx).WithName("grpc-server")
-	log.Info("Starting gRPC server", "address", listener.Addr().String())
+	logger := logging.FromContext(ctx).With("component", "grpc_server")
+	logger.InfoContext(ctx, "starting gRPC server", "address", listener.Addr().String())
 	s.healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 
 	serveErr := make(chan error, 1)
@@ -207,7 +202,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("serve gRPC: %w", err)
 	case <-ctx.Done():
 		s.healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-		log.Info("Shutting down gRPC server")
+		logger.InfoContext(ctx, "shutting down gRPC server")
 		s.gracefulStop(defaultShutdownTimeout)
 		if err := <-serveErr; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			return fmt.Errorf("serve gRPC during shutdown: %w", err)

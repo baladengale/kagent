@@ -51,17 +51,6 @@ Allows overriding it for multi-namespace deployments in combined charts.
 {{- end }}
 
 {{/*
-Namespaces where Substrate ate-api-server needs read access to Secrets and ConfigMaps
-referenced by generated ActorTemplates (install namespace plus rbac.namespaces).
-*/}}
-{{- define "kagent.substrate.envSourceNamespaces" -}}
-{{- $installNs := include "kagent.namespace" . -}}
-{{- $extra := .Values.rbac.namespaces | default list -}}
-{{- $all := append $extra $installNs | uniq | sortAlpha -}}
-{{- join "," $all -}}
-{{- end }}
-
-{{/*
 Watch namespaces - transforms list of namespaces cached by the controller into comma-separated string.
 Precedence: controller.watchNamespaces (explicit override) > rbac.namespaces > empty (watch all).
 */}}
@@ -245,18 +234,6 @@ Password secret name - returns the chart-managed Secret name for POSTGRES_PASSWO
 {{- printf "%s-postgresql" (include "kagent.fullname" .) -}}
 {{- end -}}
 
-{{/*
-A2A Base URL - computes the default URL based on the controller service name if not explicitly set.
-The `name.namespace.svc` short form is used so the URL resolves regardless of the cluster's DNS domain.
-*/}}
-{{- define "kagent.a2aBaseUrl" -}}
-{{- if .Values.controller.a2aBaseUrl -}}
-{{- .Values.controller.a2aBaseUrl -}}
-{{- else -}}
-{{- printf "http://%s-controller.%s.svc:%d" (include "kagent.fullname" .) (include "kagent.namespace" .) (.Values.controller.service.ports.port | int) -}}
-{{- end -}}
-{{- end -}}
-
 {{/* Public gRPC endpoint advertised by AgentInstance Agent Cards. */}}
 {{- define "kagent.a2aGatewayUrl" -}}
 {{- if .Values.controller.a2aGatewayUrl -}}
@@ -283,4 +260,62 @@ Reads .Values.global.imagePullSecrets set by the parent chart.
 imagePullSecrets:
 {{- toYaml $global | nindent 2 }}
 {{- end -}}
+{{- end -}}
+
+{{/*
+Endpoint the controller dials to reach ateapi.
+
+An explicit controller.substrate.ateApiEndpoint always wins. Otherwise, when
+substrate is installed as a subchart of this release, its own helper is asked
+for the endpoint: the chart prefixes resource names with the release name for
+any release not called "substrate", so the Service is not at the canonical
+api.ate-system.svc and only the subchart knows what it rendered.
+
+Empty when substrate is not a subchart, which leaves the controller on its
+compiled-in default — correct for the topology where substrate is installed as
+its own release and the endpoint is passed explicitly.
+*/}}
+{{- define "kagent.substrate.ateApiEndpoint" -}}
+{{- if .Values.controller.substrate.ateApiEndpoint -}}
+{{- .Values.controller.substrate.ateApiEndpoint -}}
+{{- else if and .Values.substrate .Values.substrate.enabled -}}
+{{- include "substrate.ateApi.endpoint" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+URL the controller uses to reach atenet-router, resolved the same way as
+kagent.substrate.ateApiEndpoint.
+*/}}
+{{- define "kagent.substrate.atenetRouterURL" -}}
+{{- if .Values.controller.substrate.atenetRouterURL -}}
+{{- .Values.controller.substrate.atenetRouterURL -}}
+{{- else if and .Values.substrate .Values.substrate.enabled -}}
+{{- include "substrate.atenetRouter.url" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Body of oauth2-proxy's custom sign_in.html template (see
+templates/oauth2-proxy-templates.yaml). Kept as its own named template, rather
+than inline in that ConfigMap, so oauth2-proxy.extraEnv in values.yaml can hash
+the content.
+
+oauth2-proxy renders this as its own Go html/template (not a Helm template) when
+it shows the sign-in page to an unauthenticated visitor -- e.g. a request to
+/agents/foo is served this page at /oauth2/sign_in?rd=%2Fagents%2Ffoo.
+`Redirect` is oauth2-proxy's template variable carrying that original
+destination (escaped with a Helm string-literal action so Helm emits it for
+oauth2-proxy to evaluate, instead of trying to evaluate it itself). It is
+forwarded to kagent's branded /login page.
+*/}}
+{{- define "kagent.oauth2ProxySignInHTML" -}}
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="refresh" content="0;url=/login?rd={{ "{{" }} or .Redirect "/" | urlquery {{ "}}" }}">
+  <script>window.location.href = "/login?rd={{ "{{" }} or .Redirect "/" | urlquery {{ "}}" }}";</script>
+</head>
+<body>Redirecting to login...</body>
+</html>
 {{- end -}}
