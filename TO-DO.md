@@ -1,0 +1,3 @@
+Do we need to update ADK or python controller code? Can we instead do monkey patch to make existing upstream release through config map with required python file instead of complete rebuild? Think through and implement with no custom code or minimal custom code through monkey patch code
+
+In the overall kagent framework, how can we implement strong plan mode and generate strict To-Do and follow that through out and update it, how do you think this is feasible in kagent agent?
