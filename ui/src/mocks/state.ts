@@ -310,7 +310,7 @@ const INSTANCE_SHARES_KEY = "kagent.mock.instanceShares";
  */
 export const SEEDED_INSTANCE_SHARE: AgentInstanceShare = {
   id: "mock-instance-share-seed",
-  namespace: "kagent",
+
   agentInstanceId: "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44",
   permission: "readOnly",
   createdAt: "2026-08-01T09:00:00Z",
@@ -359,14 +359,12 @@ function readTokens(): Record<string, string> {
 }
 
 export function createInstanceShare(
-  namespace: string,
   agentInstanceId: string,
   permission: AgentInstanceSharePermission,
 ): { share: AgentInstanceShare; token: string } {
   const existing = readInstanceShares();
   const share: AgentInstanceShare = {
     id: `mock-share-${existing.length + 1}`,
-    namespace,
     agentInstanceId,
     permission,
     createdAt: new Date().toISOString(),
@@ -403,13 +401,8 @@ export function revokeInstanceShare(shareId: string): boolean {
 // Agent instances
 // ---------------------------------------------------------------------------
 
-/**
- * How an instance is addressed, and it is not a resource ref.
- *
- * `namespace/id` because that is the pair `AgentInstanceService` takes on every
- * call — an instance has no name, and the id is a UUID scoped to its namespace.
- */
-export const agentInstanceRef = (row: AgentInstance) => `${row.namespace}/${row.id}`;
+/** The UUID used to address a conversation. */
+export const agentInstanceRef = (row: AgentInstance) => row.id;
 
 /**
  * Every instance, with anything suspend or resume has done to it folded in.
@@ -435,5 +428,52 @@ export function saveAgentInstance(row: AgentInstance): AgentInstance {
   );
   if (at === -1) created.agentInstances.push(row);
   else created.agentInstances[at] = row;
+  return row;
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * A saved turn boundary, kept the way the controller keeps one.
+ *
+ * `headTaskId` is the whole point of storing these rather than inventing a
+ * checkpoint per fork: it is what ties a boundary back to a message in the
+ * transcript, so a page that reloads still marks the messages that were saved.
+ */
+export interface MockCheckpoint {
+  id: string;
+  agentInstanceId: string;
+  headTaskId: string;
+  createdAt: string;
+}
+
+/**
+ * One boundary already saved against the seeded conversation.
+ *
+ * So the chat has a checkpointed message to render, and a fork to start from, before
+ * anybody presses anything — the same reason `SEEDED_INSTANCE_SHARE` exists.
+ */
+export const SEEDED_CHECKPOINT: MockCheckpoint = {
+  id: "3f5b1c88-91d2-4a0e-b7c6-5d1f0a2e9b34",
+  agentInstanceId: "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44",
+  headTaskId: "seed-task-1",
+  createdAt: "2025-01-04T10:15:00Z",
+};
+
+const checkpoints: MockCheckpoint[] = [SEEDED_CHECKPOINT];
+
+/** Every boundary saved against one conversation. */
+export function readCheckpoints(agentInstanceId: string): MockCheckpoint[] {
+  return checkpoints.filter((row) => row.agentInstanceId === agentInstanceId);
+}
+
+export function checkpointById(id: string): MockCheckpoint | undefined {
+  return checkpoints.find((row) => row.id === id);
+}
+
+export function saveCheckpoint(row: MockCheckpoint): MockCheckpoint {
+  checkpoints.push(row);
   return row;
 }

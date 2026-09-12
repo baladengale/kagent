@@ -12,7 +12,7 @@ import (
 	"slices"
 	"strings"
 
-	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2apb/v1/pbconv"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	v2translator "github.com/kagent-dev/kagent/go/core/internal/translator"
 	claudeconfig "github.com/kagent-dev/kagent/go/harness/claude/config"
@@ -92,9 +92,9 @@ func (c *Compiler) Compile(ctx context.Context, input *v2translator.HarnessInput
 	if err != nil {
 		return nil, fmt.Errorf("marshal Claude config: %w", err)
 	}
-	cardJSON, err := json.Marshal(agentTemplateCard(input.Root.Template))
+	card, err := pbconv.ToProtoAgentCard(v2translator.ManagedAgentCard(input.Root.Template))
 	if err != nil {
-		return nil, fmt.Errorf("marshal Claude agent card: %w", err)
+		return nil, fmt.Errorf("convert Claude agent card: %w", err)
 	}
 	provenance, err := c.buildProvenance(ctx, input, environment)
 	if err != nil {
@@ -114,7 +114,7 @@ func (c *Compiler) Compile(ctx context.Context, input *v2translator.HarnessInput
 		Revision: v2translator.Revision{
 			Namespace: template.Namespace, AgentTemplateName: template.Name, HarnessName: harness.Name,
 			Image: harness.Spec.Workload.Image, Environment: environment,
-			ConfigJSON: configJSON, AgentCardJSON: cardJSON,
+			ConfigJSON: configJSON, AgentCard: card,
 			WorkerPoolName:   harness.Spec.Substrate.WorkerPoolRef.Name,
 			SnapshotLocation: harness.Spec.Substrate.SnapshotPolicy.Location,
 			Provenance:       provenance, EgressDestinations: egress,
@@ -442,15 +442,6 @@ func (c *Compiler) resolveEnvironment(ctx context.Context, namespace string, env
 		resolved[i].Value, resolved[i].ValueFrom = string(value), nil
 	}
 	return resolved, nil
-}
-
-func agentTemplateCard(template *v1alpha3.AgentTemplate) *a2atype.AgentCard {
-	return &a2atype.AgentCard{
-		Name: strings.ReplaceAll(template.Name, "-", "_"), Description: template.Spec.Description, Version: "v1",
-		SupportedInterfaces: []*a2atype.AgentInterface{{URL: "http://127.0.0.1:80", ProtocolBinding: a2atype.TransportProtocolGRPC, ProtocolVersion: a2atype.Version}},
-		Capabilities:        a2atype.AgentCapabilities{Streaming: true}, Skills: []a2atype.AgentSkill{},
-		DefaultInputModes: []string{"text"}, DefaultOutputModes: []string{"text"},
-	}
 }
 
 var _ v2translator.HarnessCompiler = (*Compiler)(nil)

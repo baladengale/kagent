@@ -1,3 +1,5 @@
+import type { Client } from "@connectrpc/connect";
+import type { ScheduledRunService } from "@/generated/kagent/api/v1alpha1/scheduled_runs_pb";
 /**
  * Every call the UI knows how to make, behind a stable id.
  *
@@ -62,6 +64,7 @@ import type {
   AgentInstanceSharePermission,
   CreatedAgentInstanceShare,
 } from "./domain/agentInstances";
+import type { Checkpoint } from "./domain/checkpoints";
 import type { Harness, HarnessResource } from "./domain/harnesses";
 import type {
   AgentTemplate,
@@ -77,16 +80,8 @@ export interface ResourceRefInput {
   name: string;
 }
 
-/**
- * Which agent instance, and where.
- *
- * The namespace is not optional and not a filter: `AgentInstanceService` addresses
- * every instance as `(namespace, id)`, and `validateIdentity` on the controller
- * rejects a request whose namespace is not a DNS-1123 label — so an empty one is an
- * `InvalidArgument`, never "any namespace".
- */
+/** A database-backed conversation, identified by UUID. */
 export interface AgentInstanceRef {
-  namespace: string;
   id: string;
 }
 
@@ -137,7 +132,19 @@ export interface SubstratePageInput<Sort = string> {
  * transform and a fake all see the same named fields as the implementation — a
  * positional signature cannot be inspected by any of them.
  */
+type ScheduledRunRpc<K extends keyof Client<typeof ScheduledRunService>> = {
+  input: Parameters<Client<typeof ScheduledRunService>[K]>[0];
+  output: Awaited<ReturnType<Client<typeof ScheduledRunService>[K]>>;
+};
+
 export interface OperationMap {
+  "scheduledRuns.list": ScheduledRunRpc<"listScheduledRuns">;
+  "scheduledRuns.get": ScheduledRunRpc<"getScheduledRun">;
+  "scheduledRuns.create": ScheduledRunRpc<"createScheduledRun">;
+  "scheduledRuns.update": ScheduledRunRpc<"updateScheduledRun">;
+  "scheduledRuns.delete": ScheduledRunRpc<"deleteScheduledRun">;
+  "scheduledRuns.trigger": ScheduledRunRpc<"triggerScheduledRun">;
+  "scheduledRuns.executions": ScheduledRunRpc<"listScheduledRunExecutions">;
   "models.list": { input: NoInput; output: ModelConfig[] };
   "models.get": { input: ResourceRefInput; output: ModelConfig };
   "models.create": { input: { payload: CreateModelConfigRequest }; output: ModelConfig };
@@ -169,59 +176,24 @@ export interface OperationMap {
   };
   "prompts.delete": { input: ResourceRefInput; output: void };
 
-  /**
-   * Every agent instance in one namespace.
-   *
-   * `namespace` is required for the reason `AgentInstanceRef` gives: there is no
-   * "all namespaces" read on this service. `allCreators` asks for other people's
-   * instances as well as the caller's, which the controller authorises separately —
-   * so it can fail with `PermissionDenied` where the same call without it succeeds.
-   */
+  /** All instances visible to the caller, optionally filtered by Kubernetes targets. */
   "agentInstances.list": {
     input: {
-      namespace: string;
       allCreators?: boolean;
-      /**
-       * One agent's conversations, narrowed by the server.
-       *
-       * Both are bare names within `namespace`, both optional, and either may be
-       * given alone. The controller matches them against the `(AgentTemplate,
-       * Harness)` pair the instance's prepared revision was built from, so they
-       * select instances stored before these fields existed.
-       *
-       * Narrowing here rather than in the browser is the point: this list is paged,
-       * and filtering a page after fetching it reports "no conversations" about a
-       * row on page nine.
-       */
-      agentTemplate?: string;
-      harness?: string;
+
+      agentTemplate?: ResourceRefInput;
+      harness?: ResourceRefInput;
     };
     output: AgentInstance[];
   };
   "agentInstances.get": { input: AgentInstanceRef; output: AgentInstance };
-  /**
-   * Creates an instance from a harness and a template.
-   *
-   * The whole request is those two names and a namespace — there is no spec here.
-   * That is the model rather than a simplification: what an agent *is* belongs to
-   * the `AgentTemplate` and how it *runs* belongs to the `Harness`, so creating one
-   * is choosing a pair.
-   *
-   * The pair has to be one the controller admits, and it must have reached a ready
-   * prepared revision; anything else is `FailedPrecondition`. `admitsHarness` in
-   * `domain/agentTemplates` is the first of those checks, so a picker can refuse
-   * before asking.
-   *
-   * `requestId` is the controller's idempotency key and is **required** — an absent
-   * or blank one is `InvalidArgument`, not a default. A caller retrying a create that
-   * failed should send the same id, so the retry cannot produce a second instance.
-   */
+
   "agentInstances.create": {
     input: {
-      namespace: string;
-      harness: string;
-      agentTemplate: string;
+      harness: ResourceRefInput;
+      agentTemplate: ResourceRefInput;
       requestId: string;
+
       /**
        * The reader's title for the conversation. Optional; empty means unnamed.
        *
@@ -233,6 +205,7 @@ export interface OperationMap {
     };
     output: AgentInstance;
   };
+
   /**
    * Retitles a conversation, answering with the record as it now stands.
    *
@@ -247,6 +220,50 @@ export interface OperationMap {
     input: AgentInstanceRef & { name: string };
     output: AgentInstance;
   };
+
+  /**
+   * Forks a conversation: a new instance that starts from where this one is now.
+   *
+   * Two controller calls, not one: a checkpoint of the source at its current turn
+   * boundary, then a fork of that checkpoint. The source has to be quiescent, so a
+   * conversation mid-turn is refused with `FailedPrecondition`. The fork comes back
+   * unnamed; pass `name` to title it in the same operation.
+   */
+  "agentInstances.fork": {
+    input: AgentInstanceRef & { requestId: string; name?: string };
+    output: AgentInstance;
+  };
+
+  /**
+   * Saves the conversation's current turn boundary, so a fork can start from it later.
+   *
+   * The controller has no cutoff to offer: what is saved is wherever the conversation
+   * stands now. A conversation mid-turn has no boundary to save and is refused with
+   * `FailedPrecondition`.
+   */
+  "agentInstances.checkpoints.create": {
+    input: AgentInstanceRef & { requestId: string };
+    output: Checkpoint;
+  };
+
+  /** Every boundary saved against this conversation, newest first. */
+  "agentInstances.checkpoints.list": {
+    input: AgentInstanceRef;
+    output: Checkpoint[];
+  };
+
+  /**
+   * Forks a saved boundary: a new conversation holding the transcript up to it.
+   *
+   * Unlike `agentInstances.fork` this starts from a boundary saved earlier, so the
+   * fork's history stops there rather than at the source's latest turn. The fork
+   * comes back unnamed; pass `name` to title it in the same operation.
+   */
+  "agentInstances.checkpoints.fork": {
+    input: { checkpointId: string; requestId: string; name?: string };
+    output: AgentInstance;
+  };
+
   /**
    * Deletes an instance.
    *
@@ -254,20 +271,7 @@ export interface OperationMap {
    * conversation, so its tasks go too. Every caller confirms first.
    */
   "agentInstances.delete": { input: AgentInstanceRef; output: void };
-  /**
-   * Suspends and resumes, each answering with the instance as it now stands.
-   *
-   * Two ids rather than one taking a direction, because they are two RPCs and
-   * because an override should be able to re-point one without the other — the
-   * same reason a list and a create are never one id here.
-   */
-  /**
-   * Share links over one instance.
-   *
-   * The instance *is* the conversation, so sharing one shares what was said. The
-   * token is returned only by `create` — the controller stores its digest — so a
-   * caller that discards it cannot show it again.
-   */
+
   "agentInstances.shares.list": {
     input: AgentInstanceRef;
     output: AgentInstanceShare[];
@@ -276,20 +280,16 @@ export interface OperationMap {
     input: AgentInstanceRef & { permission: AgentInstanceSharePermission };
     output: CreatedAgentInstanceShare;
   };
+
   /** Revoked by share id, not by token: the token is not stored to match on. */
   "agentInstances.shares.revoke": {
-    input: { namespace: string; shareId: string };
+    input: { shareId: string };
     output: void;
   };
 
   "agentInstances.suspend": { input: AgentInstanceRef; output: AgentInstance };
   "agentInstances.resume": { input: AgentInstanceRef; output: AgentInstance };
 
-  /**
-   * The harnesses in one namespace, or in every observed namespace when omitted.
-   *
-   * Served by `HarnessService`; a Harness is the reusable runtime half of an agent.
-   */
   "harnesses.list": { input: { namespace?: string }; output: Harness[] };
   /**
    * Creates a harness from a whole custom resource.

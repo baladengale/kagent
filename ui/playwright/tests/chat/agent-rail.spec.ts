@@ -47,7 +47,7 @@ test("chat: a conversation's record is read without leaving the conversation", a
   await expect(fields).toContainText(instances.ready);
 
   // Still on the conversation behind it — the point of not making this a page.
-  await expect(page).toHaveURL(new RegExp(`/agents/kagent/${instances.ready}/chat$`));
+  await expect(page).toHaveURL(new RegExp(`/agents/${instances.ready}/chat$`));
   await expect(page.getByTestId("chat-input")).toBeVisible();
 
   // There is no Edit anywhere on it: an instance has no spec to change. What the agent
@@ -95,8 +95,9 @@ test("agent rail: a conversation is deleted from a menu, on every surface", asyn
 
   await test.step("1. the menu offers it, and the row is otherwise quiet", async () => {
     const menu = rail.locator(sibling);
-    // Present for a pointer to find, but not drawn until the row is hovered.
-    await expect(menu).toHaveCSS("opacity", "0");
+    // Drawn on every row, not revealed on hover: these actions are most of the reason
+    // to open the rail on a conversation you are not in.
+    await expect(menu).toBeVisible();
     await menu.click({ force: true });
     await expect(item).toBeVisible();
     // The dropdown animates in, and a click landing mid-transition is refused as
@@ -342,6 +343,12 @@ test("chat: the agent panel says what the conversation cannot", async ({ page })
    * live on the `AgentTemplate` it was cut from. So this panel reads the template,
    * which is also a thing the reader can open and change.
    */
+  /*
+   * Wider than the project's 1280, because the panel folds itself away below 1440 —
+   * see `CONTEXT_COLLAPSES_BELOW`. At the default width this asserts the responsive
+   * behaviour rather than the panel's content, which is what it is about.
+   */
+  await page.setViewportSize({ width: 1600, height: 900 });
   await page.goto(AGENT_CHAT);
   const panel = page.getByTestId("chat-agent-context");
   await expect(panel).toBeVisible({ timeout: 30_000 });
@@ -652,5 +659,44 @@ test("agent rail: a conversation can be renamed from inside it, two ways", async
     await expect(
       rail.locator(`a[data-testid="chat-session-${SIBLING_OF_READY}"]`),
     ).toContainText("Named from the rail");
+  });
+});
+
+test("agent rail: only the page you are on is marked as current", async ({ page }) => {
+  /*
+   * A conversation row used to be lit by id alone, so it claimed to be the current
+   * page on every surface that mounts the rail for an instance — the agent's own
+   * details page included, which is a different page from the chat the row links to.
+   * Two rows then carried `aria-current="page"` at once, which is both wrong on its
+   * face and wrong for a screen reader.
+   *
+   * Asserted from the details page rather than the chat, because the chat is the one
+   * place the old behaviour happened to be right.
+   */
+  await page.goto(AGENT_DETAILS);
+
+  const rail = page.getByTestId("chat-sessions");
+  await expect(rail).toBeVisible({ timeout: 30_000 });
+
+  const row = rail.locator(`a[data-testid="chat-session-${instances.ready}"]`);
+
+  await test.step("1. the conversation is listed, but is not the current page", async () => {
+    await expect(row).toBeVisible();
+    await expect(row).toHaveAttribute("data-active", "false");
+    await expect(row).not.toHaveAttribute("aria-current", "page");
+  });
+
+  await test.step("2. exactly one entry in the rail claims to be current", async () => {
+    // The count is the assertion. Any single row being right is not enough when the
+    // defect was two of them being right at the same time.
+    await expect(page.locator('[data-testid="chat-sessions-nav"] [aria-current="page"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="chat-sessions"] [aria-current="page"]')).toHaveCount(0);
+  });
+
+  await test.step("3. opening the conversation is what makes it current", async () => {
+    await row.click();
+    await expect(page).toHaveURL(new RegExp(`${instances.ready}/chat$`));
+    await expect(row).toHaveAttribute("data-active", "true");
+    await expect(row).toHaveAttribute("aria-current", "page");
   });
 });

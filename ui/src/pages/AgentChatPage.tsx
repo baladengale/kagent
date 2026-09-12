@@ -3,13 +3,13 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { Alert, Button, Tooltip } from "antd";
 import { FileText, PanelRightClose, PanelRightOpen, Share2 } from "lucide-react";
 import { useTheme } from "@emotion/react";
+import toast from "react-hot-toast";
 import { ChatComposer, type ChatComposerHandle } from "@/components/chat/ChatComposer";
 import { ShareDialog } from "@/components/chat/ShareDialog";
 import { AgentRail } from "@/components/agent/AgentRail";
 import { iconControlStyles } from "@/components/agent/controlStyles";
 import { AgentContextPanel } from "@/components/chat/AgentContextPanel";
 import { ConversationDetailsModal } from "@/components/chat/ConversationDetailsModal";
-import { ResizableAside } from "@/components/chat/ResizableAside";
 import { ChatTranscript } from "@/components/chat/ChatTranscript";
 import { isLifecycleBusy } from "@/components/chat/lifecycleReading";
 import { paths } from "@/router/routes";
@@ -23,6 +23,12 @@ import {
 } from "@/api";
 import { autoTitleFrom } from "@/components/agent-instances/instanceLabels";
 import { useLiveTranscript } from "@/api/hooks/useLiveTranscript";
+import { useInvalidateConversations } from "@/api/hooks/useInvalidateConversations";
+import { useCheckpoints } from "@/api/hooks/useCheckpoints";
+import { useCollapsedBelow } from "@/components/chat/useNarrowViewport";
+import { checkpointsByMessage } from "@/components/chat/messageCheckpoints";
+import { useExtensionAgentLinks } from "@/appExtensions/hooks";
+import { agentUrl } from "@/components/agent/agentUrl";
 
 /**
  * How often the instance is re-read while it is doing something.
@@ -38,9 +44,9 @@ const LIFECYCLE_POLL_MS = 1_000;
  *
  * ## There is no session id here
  *
- * An `AgentInstance` *is* the conversation. The A2A gateway files every task under
- * the instance as the task's `contextId`, and `ListTasks` for the instance is the
- * transcript — so `/agents/:namespace/:id/chat` is the whole address, and there is
+ * An `AgentInstance` owns the conversation's context and isolated history.
+ * `ListTasks` scoped to the instance returns its
+ * transcript — so `/agents/:id/chat` is the whole address, and there is
  * nothing to put in a session segment.
  *
  * That is also why "New chat" in the rail *creates* rather than navigates: another
@@ -57,25 +63,43 @@ const LIFECYCLE_POLL_MS = 1_000;
 /** Where the agent panel's open state is remembered, per reader. */
 const CONTEXT_OPEN = "kagent.chat.agentPanel.open";
 
+/**
+ * The widths at which the transcript stops having room for its neighbours.
+ *
+ * This one goes first, because it is reference you open when you want it. Then the
+ * application sidebar, at antd's `lg`. Then the rail, last, because it is the only way
+ * to the other conversations with this agent — its width lives in `AgentRail`.
+ */
+const CONTEXT_COLLAPSES_BELOW = 1440;
+
+/** Boundaries saved on this page, and the conversation they were saved in. */
+interface SavedMarks {
+  conversation?: string;
+  marks: ReadonlyMap<string, string>;
+}
+
+/** Stable, so a page with nothing saved does not re-derive its marks every render. */
+const NO_MARKS: SavedMarks = { marks: new Map() };
+
 export function AgentChatPage() {
   const theme = useTheme();
   const navigate = useNavigate();
-  const { namespace, id } = useParams();
+  const { id } = useParams();
   const location = useLocation();
 
-  const instance = useAgentInstance(namespace, id);
+  const instance = useAgentInstance(id);
   /*
-   * Every instance in this namespace, for the rail's list of sibling conversations.
+   * Every instance visible to the caller, for the rail's list of sibling conversations.
    *
    * Read here rather than in the rail because this page is the one that creates and
    * deletes them, so it is the one that has to refresh the list afterwards — and a
    * rail reading its own copy would show a conversation this page had just removed.
    */
-  const instances = useAgentInstances(namespace);
+  const instances = useAgentInstances();
 
   const conversation = useMemo(
-    () => (namespace && id ? { namespace, id } : undefined),
-    [namespace, id],
+    () => (id ? { id, contextId: instance.data?.contextId } : undefined),
+    [id, instance.data?.contextId],
   );
   /**
    * Resume a suspended conversation before any turn begins.
@@ -114,15 +138,11 @@ export function AgentChatPage() {
      render to undo the first. */
   const pendingState = askedFor === instance.data?.state ? undefined : askedFor;
 
-
-
-
-
   const resumeFirst = useCallback(async () => {
-    if (instance.data?.state !== "suspended" || !namespace || !id) return;
+    if (instance.data?.state !== "suspended" || !id) return;
     setPendingState("ready");
     try {
-      await apiClient.agentInstances.resume(namespace, id);
+      await apiClient.agentInstances.resume(id);
       await instance.refresh();
     } catch (cause: unknown) {
       // Back to the truth: the turn is about to fail too, and a row claiming ready
@@ -131,7 +151,7 @@ export function AgentChatPage() {
       throw cause;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [instance.data?.state, namespace, id]);
+  }, [instance.data?.state, id]);
 
   const chat = useChat(conversation, resumeFirst);
 
@@ -169,6 +189,105 @@ export function AgentChatPage() {
   const [isSharing, setSharing] = useState(false);
   const [isShowingDetails, setShowingDetails] = useState(false);
 
+  const invalidateConversations = useInvalidateConversations();
+  const links = useExtensionAgentLinks();
+  const checkpoints = useCheckpoints(id);
+  /**
+   * Boundaries saved since this page loaded, by the message they were saved at.
+   *
+   * See `checkpointsByMessage`: the controller ties a checkpoint to a *turn*, and the
+   * message the reader has just sent does not know its turn yet.
+   */
+  /*
+   * Held against the conversation it belongs to, and read only for that one.
+   *
+   * The marks are keyed by message id, and a fork is given copies of its source's
+   * messages under the same ids — so a fork opened from this page inherited marks for
+   * boundaries it does not have. Carrying the conversation with them is what drops
+   * them: a different `id` reads as no marks, with no effect to clear anything and no
+   * render in between where the old ones still apply. The same shape `useChat` gives
+   * its transcript, and for the same reason. The controller's list is the truth; this
+   * only ever covers the gap before the first read of it lands.
+   */
+  const [savedHere, setSavedHere] = useState<SavedMarks>(NO_MARKS);
+  const marksHere = savedHere.conversation === id ? savedHere.marks : NO_MARKS.marks;
+  const [isCheckpointing, setCheckpointing] = useState(false);
+
+  const checkpointByMessage = useMemo(
+    () => checkpointsByMessage(chat.messages, checkpoints.data, marksHere),
+    [chat.messages, checkpoints.data, marksHere],
+  );
+  /*
+   * Whether there is a boundary to save.
+   *
+   * Something has to have been said, and the latest turn must not already be saved —
+   * a second checkpoint at the same boundary is a second row that forks identically,
+   * which is a way of filling the list rather than a thing anyone wants.
+   */
+  const latest = chat.messages[chat.messages.length - 1];
+  const canCheckpoint = Boolean(latest) && !checkpointByMessage.has(latest.id);
+
+  /*
+   * Saves the conversation's current turn boundary.
+   *
+   * Recorded against the reader's latest message as well as read back from the
+   * controller, because the boundary has to show before the next read lands — see
+   * `checkpointsByMessage` for why the message alone cannot say which turn it is in.
+   */
+  const checkpointChat = useCallback(async () => {
+    if (!id) return;
+    const anchor = [...chat.messages].reverse().find((m) => m.role === "user")?.id;
+    setCheckpointing(true);
+    try {
+      const checkpoint = await apiClient.agentInstances.checkpoints.create(id);
+      if (anchor) {
+        setSavedHere((current) => {
+          const marks = new Map(current.conversation === id ? current.marks : []);
+          marks.set(anchor, checkpoint.id);
+          return { conversation: id, marks };
+        });
+      }
+      await checkpoints.refresh();
+      toast.success("Checkpoint saved");
+    } catch (cause: unknown) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      console.error("Could not checkpoint the conversation:", cause);
+      toast.error(`Could not checkpoint: ${reason}`);
+    } finally {
+      setCheckpointing(false);
+    }
+  }, [id, chat.messages, checkpoints]);
+
+  /*
+   * A new conversation holding the transcript up to a saved boundary, which is then
+   * opened. Forking the same boundary again is allowed and makes another one.
+   */
+  const forkCheckpoint = useCallback(
+    async (checkpointId: string) => {
+      const title = instance.data?.name || autoTitle;
+      try {
+        const forked = await apiClient.agentInstances.checkpoints.fork(
+          checkpointId,
+          title ? `${title} (fork)` : undefined,
+        );
+        await invalidateConversations();
+        toast.success(title ? `Forked "${title}"` : "Forked the conversation");
+        navigate(links?.chat?.({ id: forked.id }) ?? agentUrl.chat({ id: forked.id }));
+      } catch (cause: unknown) {
+        const reason = cause instanceof Error ? cause.message : String(cause);
+        console.error("Could not fork conversation:", cause);
+        toast.error(`Could not fork: ${reason}`);
+      }
+    },
+    [
+      instance.data?.name,
+      autoTitle,
+      invalidateConversations,
+      links,
+      navigate,
+    ],
+  );
+
   /**
    * Starts another conversation with this agent.
    *
@@ -176,7 +295,6 @@ export function AgentChatPage() {
    * this needs the current instance loaded to copy the pair from. The rail's button
    * is disabled until then rather than creating something from a half-read record.
    */
-
 
   /*
    * Whether this agent can be talked to at all.
@@ -228,15 +346,27 @@ export function AgentChatPage() {
    * Absent means open: a reader who has never touched it gets the context, which is
    * the more useful default for somebody meeting an agent for the first time.
    */
-  const [isContextOpen, setContextOpen] = useState(
+  const [isNarrowForContext, setNarrowForContext] = useCollapsedBelow(
+    CONTEXT_COLLAPSES_BELOW,
+  );
+  const [wantsContext, setWantsContext] = useState(
     () => window.localStorage.getItem(CONTEXT_OPEN) !== "false",
   );
+  const isContextOpen = wantsContext && !isNarrowForContext;
 
+  /*
+   * The reader's choice and the window's, kept apart.
+   *
+   * Only the stored preference is written: a panel closed because the window shrank is
+   * not a reader saying they do not want it, and remembering it that way would leave it
+   * shut on the next wide session. Opening it on a narrow window clears the width's
+   * veto until the next crossing — the same bargain antd's sidebar makes.
+   */
   function toggleContext() {
-    setContextOpen((open) => {
-      window.localStorage.setItem(CONTEXT_OPEN, String(!open));
-      return !open;
-    });
+    const open = !isContextOpen;
+    window.localStorage.setItem(CONTEXT_OPEN, String(open));
+    setWantsContext(open);
+    if (open) setNarrowForContext(false);
   }
 
   /** The message box, so the caret can be handed back to it after a question. */
@@ -318,7 +448,7 @@ export function AgentChatPage() {
     // Keyed on the conversation, not on `chat`: the controller is rebuilt every render
     // and depending on it would re-run this on each one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [namespace, id, chat.isLoadingHistory]);
+  }, [id, chat.isLoadingHistory]);
   const isBusy = isLifecycleBusy(instance.data, chat.turnPhase, isAwaitingReply);
 
   /*
@@ -394,7 +524,10 @@ export function AgentChatPage() {
     <div data-testid="agent-surface">
       <div css={{
           display: "flex",
-          gap: theme.space(6),
+          // The columns are a rail, two one-icon gutters and the conversation between
+          // them. At `space(6)` the gutters sat in more air than they are wide, which
+          // read as three separated panels rather than one page.
+          gap: theme.space(2),
           /*
            * `flex-start`, not `stretch`.
            *
@@ -405,9 +538,9 @@ export function AgentChatPage() {
            */
           alignItems: "flex-start",
         }}>
-        {namespace && id ? (
+        {id ? (
           <AgentRail
-            agentRef={{ namespace, id }}
+            agentRef={{ id }}
             instance={instance.data}
             instances={instances}
             autoTitle={autoTitle}
@@ -530,8 +663,6 @@ export function AgentChatPage() {
             />
           ) : null}
 
-
-
           {/* The controller's own precondition, said rather than discovered. A
               suspended agent is resumable from the agents list, which is why the
               state is named rather than the page simply refusing. */}
@@ -553,6 +684,8 @@ export function AgentChatPage() {
           <ChatTranscript
             chat={chat}
             sessionId={id}
+            onFork={forkCheckpoint}
+            checkpointByMessage={checkpointByMessage}
             // The question is answered in a field inside the transcript, and once it
             // has been, the next thing typed is an ordinary message. The transcript
             // has no business knowing the composer exists, so the page it belongs to
@@ -583,6 +716,9 @@ export function AgentChatPage() {
               send={chat.send}
               isStreaming={chat.phase === "streaming"}
               onCancel={chat.cancel}
+              onCheckpoint={checkpointChat}
+              canCheckpoint={canCheckpoint}
+              isCheckpointing={isCheckpointing}
               // Disabled rather than hidden: a missing composer reads as a rendering
               // fault, where a disabled one with the state named above it explains
               // itself. A conversation holding a question keeps its composer, because
@@ -596,12 +732,12 @@ export function AgentChatPage() {
 
         {/*
           What the agent is, beside what it said.
-          
+
           Collapsible and remembered, like the rail: it is reference rather than
           navigation, so a reader following a long answer should be able to put it away
           — and find it away next time rather than having to close it on every
           conversation.
-          
+
           Rendered only once the instance has loaded: the panel's whole content is
           derived from the template that instance names, so an empty one would be a
           frame around nothing.
@@ -616,7 +752,7 @@ export function AgentChatPage() {
                 position: "sticky",
                 top: theme.layout.headerHeight + 24,
                 alignSelf: "start",
-                marginInlineEnd: isContextOpen ? -theme.space(3) : 0,
+                marginInlineEnd: isContextOpen ? -theme.space(2) : 0,
                 transition: "margin-inline-end 180ms ease",
               }}
             >
@@ -663,14 +799,16 @@ export function AgentChatPage() {
               }}
               aria-hidden={!isContextOpen}
             >
-              <ResizableAside
-                testId="chat-context-aside"
-                handleTestId="chat-context-handle"
-                label="Resize the agent panel"
-                defaultWidth={248}
+              {/* No drag handle. The panel had one, and the wrapper above clips to a
+                  fixed 248 with `overflow: hidden` — so dragging widened the aside
+                  inside a box that never grew, and the only visible effect was a grab
+                  cursor on an edge that did nothing. */}
+              <div
+                data-testid="chat-context-aside"
+                css={{ width: 248, maxHeight: "calc(100vh - 160px)", overflowY: "auto" }}
               >
                 <AgentContextPanel agent={instance.data} />
-              </ResizableAside>
+              </div>
             </div>
           </>
         ) : null}

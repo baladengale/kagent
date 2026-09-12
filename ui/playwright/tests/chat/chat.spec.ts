@@ -274,7 +274,7 @@ test("chat: history, sending, streaming, and tool rendering", async ({ page }) =
     // A sibling instance: the same harness and template, so the rail lists it as
     // another conversation with this agent.
     await page.getByTestId(`chat-session-${SIBLING_OF_READY}`).click();
-    await page.waitForURL(new RegExp(`/agents/kagent/${SIBLING_OF_READY}/chat$`));
+    await page.waitForURL(new RegExp(`/agents/${SIBLING_OF_READY}/chat$`));
 
     await expect(page.getByTestId("chat-empty")).toBeVisible();
     await expect(
@@ -344,6 +344,20 @@ test("chat: leaving the foot of a conversation offers a way back to it", async (
      */
     await expect(button).toHaveCount(0, { timeout: 10_000 });
   });
+
+  await test.step("4. and a transcript still growing does not take it away", async () => {
+    /*
+     * Growth landing after the pin, with the scroll event the pin queued behind it.
+     * Dispatched rather than waited for: on an idle machine the two land in the same
+     * frame, which is why this only ever failed on a loaded one.
+     */
+    await box.evaluate((node) => {
+      (node.firstElementChild as HTMLElement).style.paddingBottom = "900px";
+      node.dispatchEvent(new Event("scroll"));
+    });
+
+    await expect(button).toHaveCount(0);
+  });
 });
 
 /**
@@ -372,7 +386,7 @@ test("chat: the composer stays put when switching conversations", async ({ page 
 
   const rail = page.getByTestId("chat-sessions");
   await rail.locator(`a[data-testid="chat-session-${SIBLING_OF_READY}"]`).click();
-  await page.waitForURL(new RegExp(`/agents/kagent/${SIBLING_OF_READY}/chat$`));
+  await page.waitForURL(new RegExp(`/agents/${SIBLING_OF_READY}/chat$`));
   await expect(page.getByTestId("chat-composer")).toBeVisible();
   // Settled, not mid-transition — the assertion is about where it ends up.
   await page.waitForTimeout(1000);

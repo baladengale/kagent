@@ -1,3 +1,4 @@
+import { ScheduledRunService, ScheduledRunSchema, ScheduledRunExecutionSchema, ScheduledRunExecutionState, type ScheduledRun } from "@/generated/kagent/api/v1alpha1/scheduled_runs_pb";
 /**
  * The mock backend, as a gRPC transport.
  *
@@ -82,6 +83,10 @@ import { ToolService } from "@/generated/kagent/api/v1alpha1/tools_pb";
 import { PromptTemplateService } from "@/generated/kagent/api/v1alpha1/prompts_pb";
 import { SystemService } from "@/generated/kagent/api/v1alpha1/system_pb";
 import {
+  CheckpointService,
+  CheckpointState as PbCheckpointState,
+} from "@/generated/kagent/api/v1alpha1/checkpoints_pb";
+import {
   AgentInstanceOperation as PbAgentInstanceOperation,
   AgentInstanceService,
   AgentInstanceSharePermission as PbSharePermission,
@@ -133,7 +138,12 @@ import {
   saveModel,
   savePrompt,
   saveToolServer,
+  checkpointById,
+  readCheckpoints,
+  saveCheckpoint,
 } from "./state";
+import type { MockCheckpoint } from "./state";
+import { mockForkTranscript, mockLatestTaskId } from "@/api/chat/mockChatClient";
 
 /** What a fake is told about the call it is answering. */
 interface MockCall {
@@ -603,7 +613,7 @@ function agentInstanceMessage(
 ): MessageInitShape<typeof AgentInstanceSchema> {
   return {
     id: row.id,
-    namespace: row.namespace,
+
     // Empty is what an unnamed conversation carries on the wire — proto3 has no
     // absent string — so it goes back empty rather than omitted, and the client
     // turns it into a title rather than treating it as a gap.
@@ -623,26 +633,16 @@ function agentInstanceMessage(
       : undefined,
     createdAt: stamp(row.createdAt),
     updatedAt: stamp(row.updatedAt),
-    labels: row.labels,
   };
 }
 
-/**
- * The namespace check the controller performs, performed here too.
- *
- * `validateNamespace` in `go/core/v2/agentinstance/service.go` requires a DNS-1123
- * label, so an empty namespace is an `InvalidArgument` and emphatically *not* "every
- * namespace". A fake that quietly listed everything for an empty namespace would
- * make a page that forgot to pass one look like it worked, right up until it met a
- * cluster.
- */
+/** Required Kubernetes target namespaces must be DNS-1123 labels. */
 const DNS_1123_LABEL = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 
 function requireNamespace(namespace: string): string {
   if (namespace.length > 63 || !DNS_1123_LABEL.test(namespace)) {
     throw new ConnectError(
-      `namespace is invalid: "${namespace}" is not a DNS-1123 label. ` +
-        `AgentInstanceService has no cross-namespace read.`,
+      `namespace is invalid: "${namespace}" is not a DNS-1123 label.`,
       Code.InvalidArgument,
     );
   }
@@ -673,11 +673,6 @@ function requireOptionalName(field: string, value: string | undefined): string {
 }
 
 /** The name half of a `namespace/name` ref, which is what the filters match on. */
-function bareRefName(ref: string | undefined): string | undefined {
-  if (!ref) return undefined;
-  const slash = ref.lastIndexOf("/");
-  return slash === -1 ? ref : ref.slice(slash + 1);
-}
 
 /**
  * The name check the controller performs: `validateName`.
@@ -739,19 +734,19 @@ const INSTANCE_MAX_PAGE_SIZE = 100;
  * read finds nothing, because that — and not an empty body — is the state a detail
  * page has to handle.
  */
-function instanceFor(namespace: string, id: string, call: MockCall): AgentInstance {
+function instanceFor(id: string, call: MockCall): AgentInstance {
   const found =
     call.scenario === "empty"
       ? undefined
       : allAgentInstances().find(
-          (row) => agentInstanceRef(row) === `${namespace}/${id}`,
+        (row) => agentInstanceRef(row) === id,
         );
-  if (!found) throw notFound(`AgentInstance ${namespace}/${id}`);
+  if (!found) throw notFound(`AgentInstance ${id}`);
   /*
    * Somebody else's conversation is not found, not forbidden.
    *
    * The controller resolves every single-instance read through
-   * `GetAgentInstanceForUser` — `WHERE namespace = $1 AND id = $2 AND user_id = $3`
+   * `GetAgentInstanceForUser` — `WHERE id = $1 AND user_id = $2`
    * — so an instance created by another user simply is not there as far as this
    * caller is concerned, and the A2A gateway reads through the same call. Every
    * lifecycle operation, the rename and the delete go through here, so all of them
@@ -762,7 +757,7 @@ function instanceFor(namespace: string, id: string, call: MockCall): AgentInstan
    * and the page could claim a link works when it does not.
    */
   if (found.creator !== MOCK_INSTANCE_CREATOR) {
-    throw notFound(`AgentInstance ${namespace}/${id}`);
+    throw notFound(`AgentInstance ${id}`);
   }
   return found;
 }
@@ -781,7 +776,6 @@ function instanceFor(namespace: string, id: string, call: MockCall): AgentInstan
  * record handed back is final, not a promise to look again later.
  */
 function lifecycle(
-  namespace: string,
   id: string,
   call: MockCall,
   from: AgentInstanceState,
@@ -789,7 +783,6 @@ function lifecycle(
   operation: AgentInstanceOperation,
 ): AgentInstance {
   const instance = instanceFor(
-    requireNamespace(namespace),
     requireInstanceId(id),
     call,
   );
@@ -819,7 +812,6 @@ function lifecycle(
 }
 
 on(AgentInstanceService.method.listAgentInstances, (input, call) => {
-  const namespace = requireNamespace(input.namespace);
   if (call.scenario === "empty") return { agentInstances: [], page: {} };
 
   const pageSize = input.page?.limit ? input.page.limit : INSTANCE_DEFAULT_PAGE_SIZE;
@@ -830,36 +822,20 @@ on(AgentInstanceService.method.listAgentInstances, (input, call) => {
     );
   }
 
-  /*
-   * The template and harness filters, refused where the controller refuses them.
-   *
-   * `validateOptionalName` requires a DNS-1123 subdomain for each when it is set,
-   * and a client that sent a qualified `namespace/name` ref would be rejected —
-   * which is easy to do by accident, since that is exactly the shape the instance
-   * *reports* its pair in.
-   */
-  const templateFilter = requireOptionalName("agent_template", input.agentTemplate);
-  const harnessFilter = requireOptionalName("harness", input.harness);
+  const templateFilter = input.agentTemplate ? `${requireNamespace(input.agentTemplate.namespace)}/${requireOptionalName("agent_template", input.agentTemplate.name)}` : "";
+  const harnessFilter = input.harness ? `${requireNamespace(input.harness.namespace)}/${requireOptionalName("harness", input.harness.name)}` : "";
 
   const matching = allAgentInstances().filter((row) => {
-    if (row.namespace !== namespace) return false;
     // Somebody else's instances are excluded unless asked for, which is what the
     // controller does with the authenticated user. Mock mode has nobody signed in,
     // so every caller is treated as one fixed person — see `MOCK_INSTANCE_CREATOR`.
     if (!input.allCreators && row.creator !== MOCK_INSTANCE_CREATOR) return false;
-    /*
-     * Matched on the bare name, because the controller resolves these through the
-     * instance's prepared revision rather than against the ref it reports. An
-     * instance with no pair matches no filter at all — the controller's own query
-     * left-joins the revision, so a NULL never satisfies an equality.
-     */
-    if (templateFilter && bareRefName(row.agentTemplate) !== templateFilter) {
+
+    if (templateFilter && row.agentTemplate !== templateFilter) {
       return false;
     }
-    if (harnessFilter && bareRefName(row.harness) !== harnessFilter) return false;
-    return Object.entries(input.matchLabels ?? {}).every(
-      ([key, value]) => row.labels[key] === value,
-    );
+    if (harnessFilter && row.harness !== harnessFilter) return false;
+    return true;
   });
 
   // The token is the id to resume after — opaque to the client, which only ever
@@ -879,7 +855,6 @@ on(AgentInstanceService.method.listAgentInstances, (input, call) => {
 on(AgentInstanceService.method.getAgentInstance, (input, call) => ({
   agentInstance: agentInstanceMessage(
     instanceFor(
-      requireNamespace(input.namespace),
       requireInstanceId(input.agentInstanceId),
       call,
     ),
@@ -888,33 +863,26 @@ on(AgentInstanceService.method.getAgentInstance, (input, call) => ({
 
 on(AgentInstanceService.method.suspendAgentInstance, (input, call) => ({
   agentInstance: agentInstanceMessage(
-    lifecycle(input.namespace, input.agentInstanceId, call, "ready", "suspended", "suspend"),
+    lifecycle(input.agentInstanceId, call, "ready", "suspended", "suspend"),
   ),
 }));
 
 on(AgentInstanceService.method.resumeAgentInstance, (input, call) => ({
   agentInstance: agentInstanceMessage(
-    lifecycle(input.namespace, input.agentInstanceId, call, "suspended", "ready", "resume"),
+    lifecycle(input.agentInstanceId, call, "suspended", "ready", "resume"),
   ),
 }));
 
 on(AgentInstanceService.method.createAgentInstance, (input, call) => {
-  const namespace = requireNamespace(input.namespace);
-  if (!input.harness.trim() || !input.agentTemplate.trim()) {
+  const namespace = requireNamespace(input.harness?.namespace ?? "");
+  if (namespace !== requireNamespace(input.agentTemplate?.namespace ?? "")) throw new ConnectError("Harness and AgentTemplate must be in the same namespace", Code.InvalidArgument);
+  if (!input.harness?.name.trim() || !input.agentTemplate?.name.trim()) {
     throw new ConnectError(
       "a harness and an agent template are both required",
       Code.InvalidArgument,
     );
   }
-  /*
-   * The controller's own rule, copied rather than approximated.
-   *
-   * `request_id` is required and this fixture used to accept its absence, so a build
-   * that never sent one passed every mock test and failed against a cluster with
-   * *"request_id must be 1-128 characters without surrounding whitespace"*. That is
-   * exactly the fixture-agrees-with-itself failure this codebase keeps having to
-   * undo, so the rule is enforced here in the same words.
-   */
+
   const requestId = input.requestId;
   if (
     requestId === "" ||
@@ -934,56 +902,33 @@ on(AgentInstanceService.method.createAgentInstance, (input, call) => {
     // The controller's own refusal for a pair whose prepared revision is not ready,
     // which is the failure a reader is most likely to meet.
     throw new ConnectError(
-      `no ready prepared revision for ${input.harness}/${input.agentTemplate}`,
+      `no ready prepared revision for ${input.harness?.name}/${input.agentTemplate?.name}`,
       Code.FailedPrecondition,
     );
   }
 
-  /*
-   * A created instance is `READY` immediately here, where the controller takes a few
-   * seconds.
-   *
-   * That is a fixture being useful rather than a fixture lying: the interesting states
-   * are already reachable — `mockAgentInstances` carries a `creating` one and a
-   * `suspended` one — and making every create sit in `creating` would mean no
-   * fixture-backed test could ever reach a conversation.
-   */
   const created = {
     // A UUID, because the controller parses one: `validateIdentity` rejects
     // anything else, so a fixture id shaped differently would pass here and fail
     // against a cluster — which is this codebase's most expensive recurring bug.
     id: crypto.randomUUID(),
-    namespace,
     name,
     creator: MOCK_INSTANCE_CREATOR,
-    harness: `${namespace}/${input.harness}`,
-    agentTemplate: `${namespace}/${input.agentTemplate}`,
+    harness: `${namespace}/${input.harness?.name}`,
+    agentTemplate: `${namespace}/${input.agentTemplate?.name}`,
     preparedRevision: "rev-mock",
-    a2aAuthority: `${input.agentTemplate}.${namespace}.svc.cluster.local:8080`,
+    a2aAuthority: `${input.agentTemplate?.name}.${namespace}.svc.cluster.local:8080`,
     state: "ready" as const,
     operation: "unspecified" as const,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    labels: {},
   };
   saveAgentInstance(created);
   return { agentInstance: agentInstanceMessage(created) };
 });
 
-/*
- * Retitling a conversation.
- *
- * Through `instanceFor`, so it inherits the creator scoping every other read has:
- * a conversation somebody else started cannot be renamed, and it is refused as
- * `NotFound` rather than as a permission error, because that is what a query
- * filtered on `user_id` produces.
- *
- * An empty name is accepted and clears the title. That is not laxity — it is the
- * controller's rule, and it is the only way a name can be taken away.
- */
 on(AgentInstanceService.method.updateAgentInstanceName, (input, call) => {
   const instance = instanceFor(
-    requireNamespace(input.namespace),
     requireInstanceId(input.agentInstanceId),
     call,
   );
@@ -1000,9 +945,62 @@ on(AgentInstanceService.method.updateAgentInstanceName, (input, call) => {
   };
 });
 
+/*
+ * Checkpoints, kept in `state.ts` the way the controller keeps them in a table.
+ *
+ * The boundary is read from the conversation itself rather than invented: the chat
+ * marks a message as checkpointed by matching its turn against `headTaskId`, so a
+ * fixture that made one up would leave the mark on nothing.
+ */
+const checkpointMessage = (row: MockCheckpoint) => ({
+  id: row.id,
+  agentInstanceId: row.agentInstanceId,
+  headTaskId: row.headTaskId,
+  state: PbCheckpointState.READY,
+  createdAt: timestampFromDate(new Date(row.createdAt)),
+});
+
+on(CheckpointService.method.createCheckpoint, (input, call) => {
+  const instance = instanceFor(requireInstanceId(input.agentInstanceId), call);
+  const checkpoint = saveCheckpoint({
+    id: crypto.randomUUID(),
+    agentInstanceId: instance.id,
+    headTaskId: mockLatestTaskId(instance.id),
+    createdAt: new Date().toISOString(),
+  });
+  return { checkpoint: checkpointMessage(checkpoint) };
+});
+
+on(CheckpointService.method.listCheckpoints, (input, call) => {
+  const instance = instanceFor(requireInstanceId(input.agentInstanceId), call);
+  return { checkpoints: readCheckpoints(instance.id).map(checkpointMessage), page: {} };
+});
+
+/*
+ * The fork copies the source's record under a new id, unnamed, exactly as the
+ * controller's `InsertForkedAgentInstance` does — and copies the transcript up to the
+ * checkpoint's turn, which is what makes forking an earlier boundary mean anything.
+ */
+on(CheckpointService.method.forkAgentInstance, (input, call) => {
+  const checkpoint = checkpointById(input.checkpointId);
+  if (!checkpoint) throw notFound(`Checkpoint ${input.checkpointId}`);
+  const source = instanceFor(checkpoint.agentInstanceId, call);
+  const now = new Date().toISOString();
+  const forked = saveAgentInstance({
+    ...source,
+    id: crypto.randomUUID(),
+    name: "",
+    state: "ready",
+    operation: "unspecified",
+    createdAt: now,
+    updatedAt: now,
+  });
+  mockForkTranscript(source.id, forked.id, checkpoint.headTaskId);
+  return { agentInstance: agentInstanceMessage(forked) };
+});
+
 on(AgentInstanceService.method.deleteAgentInstance, (input, call) => {
   const instance = instanceFor(
-    requireNamespace(input.namespace),
     requireInstanceId(input.agentInstanceId),
     call,
   );
@@ -1012,18 +1010,8 @@ on(AgentInstanceService.method.deleteAgentInstance, (input, call) => {
   return { agentInstance: agentInstanceMessage(instance) };
 });
 
-/*
- * Share links over an instance.
- *
- * Tokens are handed out in full here and only their existence is remembered, which
- * is the opposite of the controller — it stores a digest and can never show a token
- * again. That difference is deliberate and bounded: this backend lives in one
- * browser tab, and a fixture that hashed its tokens could not then serve the link
- * the spec had just been handed.
- */
 on(AgentInstanceService.method.listAgentInstanceShares, (input, call) => {
   const instance = instanceFor(
-    requireNamespace(input.namespace),
     requireInstanceId(input.agentInstanceId),
     call,
   );
@@ -1037,12 +1025,10 @@ on(AgentInstanceService.method.listAgentInstanceShares, (input, call) => {
 
 on(AgentInstanceService.method.createAgentInstanceShare, (input, call) => {
   const instance = instanceFor(
-    requireNamespace(input.namespace),
     requireInstanceId(input.agentInstanceId),
     call,
   );
   const { share, token } = createInstanceShare(
-    instance.namespace,
     instance.id,
     input.permission === PbSharePermission.READ_WRITE ? "readWrite" : "readOnly",
   );
@@ -1050,7 +1036,6 @@ on(AgentInstanceService.method.createAgentInstanceShare, (input, call) => {
 });
 
 on(AgentInstanceService.method.revokeAgentInstanceShare, (input) => {
-  requireNamespace(input.namespace);
   if (!revokeInstanceShare(input.shareId)) {
     throw new ConnectError(`share ${input.shareId} not found`, Code.NotFound);
   }
@@ -1059,7 +1044,6 @@ on(AgentInstanceService.method.revokeAgentInstanceShare, (input) => {
 
 const instanceShareMessage = (share: AgentInstanceShare) => ({
   id: share.id,
-  namespace: share.namespace,
   agentInstanceId: share.agentInstanceId,
   permission:
     share.permission === "readWrite"
@@ -1067,12 +1051,6 @@ const instanceShareMessage = (share: AgentInstanceShare) => ({
       : PbSharePermission.READ_ONLY,
   createdAt: timestampFromDate(new Date(share.createdAt)),
 });
-
-/*
- * `CheckpointService` still has no fake, deliberately: nothing in the app calls it,
- * and an unregistered RPC answers `Unimplemented` naming itself. A fixture for a
- * feature nobody built is one that will be wrong by the time somebody does.
- */
 
 // ---------------------------------------------------------------------------
 // Harnesses and agent templates
@@ -1478,3 +1456,103 @@ function publishCallCounts(): void {
 // Runs once, after every fake above has been registered — which is why it is the
 // last thing in the file.
 publishCallCounts();
+
+// Scheduling fixtures do not run agents. Manual triggers remain pending.
+const scheduledRuns = [1, 2, 3].map((n) => create(ScheduledRunSchema, {
+  id: `c686bd1d-9124-4e96-8df7-00000000000${n}`,
+  etag: `d686bd1d-9124-4e96-8df7-00000000000${n}`,
+  creator: MOCK_INSTANCE_CREATOR,
+  harness: { namespace: "kagent", name: "k8s-agent" },
+  agentTemplate: { namespace: "kagent", name: "k8s-agent-7f3a91c" },
+  config: { name: n === 1 ? "Daily cluster report" : `Schedule ${n}`, schedule: "0 9 * * *", timeZone: "UTC", prompt: "Summarize cluster health.", executionTimeout: { seconds: 900n } },
+  createdAt: stamp("2026-09-01T09:00:00Z"),
+}));
+/*
+ * One already deleted, because a delete now leaves the detail page and a reload resets
+ * these fixtures — so the state a held link lands on had no way to be read otherwise.
+ * Absent from the list, since `listScheduledRuns` drops what is deleted.
+ */
+scheduledRuns.push(create(ScheduledRunSchema, {
+  id: "c686bd1d-9124-4e96-8df7-000000000004",
+  etag: "d686bd1d-9124-4e96-8df7-000000000004",
+  creator: MOCK_INSTANCE_CREATOR,
+  harness: { namespace: "kagent", name: "k8s-agent" },
+  agentTemplate: { namespace: "kagent", name: "k8s-agent-7f3a91c" },
+  config: { name: "Retired sweep", schedule: "0 9 * * *", timeZone: "UTC", prompt: "Summarize cluster health.", executionTimeout: { seconds: 900n } },
+  createdAt: stamp("2026-09-01T09:00:00Z"),
+  deletedAt: stamp("2026-09-02T09:00:00Z"),
+}));
+const scheduleExecutions = Array.from({ length: 26 }, (_, i) => create(ScheduledRunExecutionSchema, {
+  id: `a686bd1d-9124-4e96-8df7-${String(i).padStart(12, "0")}`,
+  scheduledRunId: scheduledRuns[0].id,
+  creator: MOCK_INSTANCE_CREATOR,
+  trigger: { case: "scheduledTime", value: stamp("2026-09-01T09:00:00Z")! },
+  prompt: "Summarize cluster health.", createdAt: stamp("2026-09-01T09:00:00Z"),
+  deadline: stamp("2026-09-01T09:15:00Z"), completedAt: stamp(i === 1 ? "2026-09-01T09:15:00Z" : "2026-09-01T09:01:00Z"),
+  state: i === 1 ? ScheduledRunExecutionState.TIMED_OUT : ScheduledRunExecutionState.SUCCEEDED,
+  failureReason: i === 1 ? "Execution deadline exceeded" : "",
+  agentInstanceId: "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44", taskId: `mock-scheduled-task-${i}`,
+}));
+const scheduleRequests = new Map<string, ScheduledRun>();
+function scheduledRunFor(id: string, call: MockCall) {
+  const schedule = call.scenario !== "empty" && scheduledRuns.find((row) => row.id === id);
+  if (!schedule) throw notFound("schedule");
+  return schedule;
+}
+function schedulePage<T extends { id: string }>(rows: T[], page: { limit: number; pageToken: string } | undefined) {
+  const start = page?.pageToken ? rows.findIndex((row) => row.id === page.pageToken) + 1 : 0;
+  const size = page?.limit || 25;
+  const result = rows.slice(start, start + size);
+  return { rows: result, page: { nextPageToken: start + size < rows.length ? result[result.length - 1].id : "" } };
+}
+on(ScheduledRunService.method.listScheduledRuns, (input, call) => {
+  const page = schedulePage(call.scenario === "empty" ? [] : scheduledRuns.filter((row) => !row.deletedAt), input.page);
+  return { scheduledRuns: page.rows, page: page.page };
+});
+on(ScheduledRunService.method.getScheduledRun, (input, call) => ({ scheduledRun: scheduledRunFor(input.scheduledRunId, call) }));
+on(ScheduledRunService.method.createScheduledRun, (input) => {
+  const prior = scheduleRequests.get(input.requestId);
+  if (prior) return { scheduledRun: prior };
+  if (!input.requestId || !input.config?.prompt.trim() || !input.harness?.name || !input.agentTemplate?.name || input.harness.namespace !== input.agentTemplate.namespace) {
+    throw new ConnectError("A prompt, request ID and an agent in one namespace are required", Code.InvalidArgument);
+  }
+  const schedule = create(ScheduledRunSchema, {
+    id: crypto.randomUUID(), etag: crypto.randomUUID(), creator: MOCK_INSTANCE_CREATOR,
+    harness: input.harness, agentTemplate: input.agentTemplate, config: input.config,
+    createdAt: timestampFromDate(new Date()),
+  });
+  scheduledRuns.unshift(schedule);
+  scheduleRequests.set(input.requestId, schedule);
+  return { scheduledRun: schedule };
+});
+on(ScheduledRunService.method.updateScheduledRun, (input, call) => {
+  const schedule = scheduledRunFor(input.scheduledRunId, call);
+  if (schedule.deletedAt) throw new ConnectError("Schedule was deleted", Code.FailedPrecondition);
+  if (schedule.etag !== input.etag) throw new ConnectError("Schedule changed. Reopen the editor and retry.", Code.Aborted);
+  schedule.config = input.config;
+  schedule.etag = crypto.randomUUID();
+  return { scheduledRun: schedule };
+});
+on(ScheduledRunService.method.deleteScheduledRun, (input, call) => {
+  const schedule = scheduledRunFor(input.scheduledRunId, call);
+  schedule.deletedAt ??= timestampFromDate(new Date());
+  schedule.nextExecutionTime = undefined;
+  return { scheduledRun: schedule };
+});
+on(ScheduledRunService.method.triggerScheduledRun, (input, call) => {
+  const schedule = scheduledRunFor(input.scheduledRunId, call);
+  if (schedule.deletedAt) throw new ConnectError("Schedule was deleted", Code.FailedPrecondition);
+  const prior = scheduleExecutions.find((row) => row.scheduledRunId === schedule.id && row.trigger.case === "manualRequestId" && row.trigger.value === input.requestId);
+  if (prior) return { execution: prior };
+  const execution = create(ScheduledRunExecutionSchema, {
+    id: crypto.randomUUID(), scheduledRunId: schedule.id, creator: MOCK_INSTANCE_CREATOR,
+    trigger: { case: "manualRequestId", value: input.requestId }, prompt: schedule.config?.prompt,
+    state: ScheduledRunExecutionState.PENDING, createdAt: timestampFromDate(new Date()),
+  });
+  scheduleExecutions.unshift(execution);
+  return { execution };
+});
+on(ScheduledRunService.method.listScheduledRunExecutions, (input, call) => {
+  const page = schedulePage(call.scenario === "empty" ? [] : scheduleExecutions.filter((row) => row.scheduledRunId === input.scheduledRunId), input.page);
+  return { executions: page.rows, page: page.page };
+});
