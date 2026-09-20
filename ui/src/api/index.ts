@@ -35,10 +35,10 @@ export type {
   OperationInput,
   OperationMap,
   OperationOutput,
-  SubstrateActorSortField,
   SubstratePageInput,
-  SubstrateSortOrder,
-  SubstrateWorkerSortField,
+  SubstrateActorPageInput,
+  SubstrateWorkerPageInput,
+  SubstrateScopeInput,
 } from "./operations";
 
 export {
@@ -85,7 +85,6 @@ export { usePrompt, usePrompts } from "./hooks/usePrompts";
 export { useNamespaces } from "./hooks/useNamespaces";
 export {
   useSubstrateActors,
-  useSubstrateStatus,
   useSubstrateSummary,
   useSubstrateWorkers,
 } from "./hooks/useSubstrate";
@@ -104,6 +103,10 @@ export {
 } from "./hooks/useAgentInstances";
 export { useInvalidateConversations } from "./hooks/useInvalidateConversations";
 export { useInvalidatePrompts } from "./hooks/useInvalidatePrompts";
+export { useInvalidateHarnesses } from "./hooks/useInvalidateHarnesses";
+export { useInvalidateModels } from "./hooks/useInvalidateModels";
+export { useInvalidateMcpServers } from "./hooks/useInvalidateMcpServers";
+export { useInvalidateAgentTemplates } from "./hooks/useInvalidateAgentTemplates";
 export type {
   AgentConversations,
 } from "./hooks/useAgentInstances";

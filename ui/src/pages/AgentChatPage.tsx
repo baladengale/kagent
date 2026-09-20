@@ -10,6 +10,8 @@ import { AgentRail } from "@/components/agent/AgentRail";
 import { iconControlStyles } from "@/components/agent/controlStyles";
 import { AgentContextPanel } from "@/components/chat/AgentContextPanel";
 import { ConversationDetailsModal } from "@/components/chat/ConversationDetailsModal";
+import { SnapshotDetailsModal } from "@/components/chat/SnapshotDetailsModal";
+import { SnapshotRenameDialog } from "@/components/chat/SnapshotRenameDialog";
 import { ChatTranscript } from "@/components/chat/ChatTranscript";
 import { isLifecycleBusy } from "@/components/chat/lifecycleReading";
 import { paths } from "@/router/routes";
@@ -18,13 +20,12 @@ import {
   useAgentInstance,
   useAgentInstances,
   useChat,
-  type AgentInstanceOperation,
-  type AgentInstanceState,
 } from "@/api";
 import { autoTitleFrom } from "@/components/agent-instances/instanceLabels";
 import { useLiveTranscript } from "@/api/hooks/useLiveTranscript";
 import { useInvalidateConversations } from "@/api/hooks/useInvalidateConversations";
 import { useCheckpoints } from "@/api/hooks/useCheckpoints";
+import type { Checkpoint } from "@/api";
 import { useCollapsedBelow } from "@/components/chat/useNarrowViewport";
 import { checkpointsByMessage } from "@/components/chat/messageCheckpoints";
 import { useExtensionAgentLinks } from "@/appExtensions/hooks";
@@ -114,42 +115,11 @@ export function AgentChatPage() {
    * awaited rather than fired alongside the send: sending into an instance that has
    * not finished resuming is the refusal this exists to avoid.
    */
-  /*
-   * What this page has just asked the conversation to become.
-   *
-   * Both changes it makes — resuming to send, and suspending when a turn ends — are
-   * asynchronous, so the record still reports the old state for a second or two
-   * afterwards. The rail's indicator went on showing that, which reads as the send or
-   * the change not having happened. This is handed to the rail so the row answers
-   * immediately, and cleared once the record agrees.
-   */
-  const [askedFor, setPendingState] = useState<AgentInstanceState>();
-  /*
-   * The operation this page has claimed but the record does not show yet.
-   *
-   * Separate from the state because they are different facts and the indicator draws
-   * them differently: suspending is amber and travelling, suspended is grey and still.
-   * Without this the button here jumped straight to grey while the same action from the
-   * rail's row menu showed the amber step — the same request reported two ways.
-   */
-  const [pendingOperation] = useState<AgentInstanceOperation>();
-  /* Derived, not cleared in an effect: once the record reports what was asked for there
-     is nothing standing in for anything, and comparing here says that without a second
-     render to undo the first. */
-  const pendingState = askedFor === instance.data?.state ? undefined : askedFor;
 
   const resumeFirst = useCallback(async () => {
     if (instance.data?.state !== "suspended" || !id) return;
-    setPendingState("ready");
-    try {
-      await apiClient.agentInstances.resume(id);
-      await instance.refresh();
-    } catch (cause: unknown) {
-      // Back to the truth: the turn is about to fail too, and a row claiming ready
-      // would outlive the error that says otherwise.
-      setPendingState(undefined);
-      throw cause;
-    }
+    await apiClient.agentInstances.resume(id);
+    await instance.refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instance.data?.state, id]);
 
@@ -212,10 +182,39 @@ export function AgentChatPage() {
   const [savedHere, setSavedHere] = useState<SavedMarks>(NO_MARKS);
   const marksHere = savedHere.conversation === id ? savedHere.marks : NO_MARKS.marks;
   const [isCheckpointing, setCheckpointing] = useState(false);
+  /*
+   * Which snapshot's details are open, as the record rather than as an id into the list.
+   *
+   * An id would make the modal's existence depend on a read that is refreshed under it:
+   * a rename re-reads the boundaries, and a `find` over the list mid-refresh is a modal
+   * that unmounts and takes the reader's half-typed name with it. A rename hands the
+   * renamed record straight back here instead, so what is on screen never waits on a
+   * list to agree with it.
+   */
+  const [openCheckpoint, setOpenCheckpoint] = useState<Checkpoint>();
+  const openSnapshot = useCallback(
+    (checkpointId: string) =>
+      setOpenCheckpoint(checkpoints.data?.find((row) => row.id === checkpointId)),
+    [checkpoints.data],
+  );
+  /* The rename box, reachable from the line as well as from the record — held as its
+     own record for the reason `openCheckpoint` is. */
+  const [renamingCheckpoint, setRenamingCheckpoint] = useState<Checkpoint>();
+  const renameSnapshot = useCallback(
+    (checkpointId: string) =>
+      setRenamingCheckpoint(checkpoints.data?.find((row) => row.id === checkpointId)),
+    [checkpoints.data],
+  );
 
   const checkpointByMessage = useMemo(
     () => checkpointsByMessage(chat.messages, checkpoints.data, marksHere),
     [chat.messages, checkpoints.data, marksHere],
+  );
+  /* The same list keyed by id, so a line can name itself without the transcript
+     searching the list once per boundary it draws. */
+  const checkpointsById = useMemo(
+    () => new Map((checkpoints.data ?? []).map((saved) => [saved.id, saved])),
+    [checkpoints.data],
   );
   /*
    * Whether there is a boundary to save.
@@ -248,15 +247,46 @@ export function AgentChatPage() {
         });
       }
       await checkpoints.refresh();
-      toast.success("Checkpoint saved");
+      toast.success("Snapshot saved");
     } catch (cause: unknown) {
       const reason = cause instanceof Error ? cause.message : String(cause);
       console.error("Could not checkpoint the conversation:", cause);
-      toast.error(`Could not checkpoint: ${reason}`);
+      toast.error(`Could not save the snapshot: ${reason}`);
     } finally {
       setCheckpointing(false);
     }
   }, [id, chat.messages, checkpoints]);
+
+  /*
+   * Removes a saved boundary.
+   *
+   * The mark this page holds for it goes too: `savedHere` is what draws the line for
+   * a boundary saved since the page loaded, so leaving it would keep the line on
+   * screen over a checkpoint the controller no longer has.
+   */
+  const deleteCheckpoint = useCallback(
+    async (checkpointId: string) => {
+      try {
+        await apiClient.agentInstances.checkpoints.remove(checkpointId);
+        setSavedHere((current) => ({
+          conversation: current.conversation,
+          marks: new Map([...current.marks].filter(([, saved]) => saved !== checkpointId)),
+        }));
+        toast.success("Snapshot deleted");
+      } catch (cause: unknown) {
+        const reason = cause instanceof Error ? cause.message : String(cause);
+        console.error("Could not delete the checkpoint:", cause);
+        toast.error(`Could not delete: ${reason}`);
+        return;
+      }
+      try {
+        await checkpoints.refresh();
+      } catch (cause: unknown) {
+        console.error("Could not re-read the saved boundaries:", cause);
+      }
+    },
+    [checkpoints],
+  );
 
   /*
    * A new conversation holding the transcript up to a saved boundary, which is then
@@ -264,14 +294,14 @@ export function AgentChatPage() {
    */
   const forkCheckpoint = useCallback(
     async (checkpointId: string) => {
-      const title = instance.data?.name || autoTitle;
       try {
-        const forked = await apiClient.agentInstances.checkpoints.fork(
-          checkpointId,
-          title ? `${title} (fork)` : undefined,
-        );
+        // No name passed: `ForkAgentInstance` titles the fork after the snapshot's
+        // own name, so sending one here would be a second rename overwriting it.
+        const forked = await apiClient.agentInstances.checkpoints.fork(checkpointId);
         await invalidateConversations();
-        toast.success(title ? `Forked "${title}"` : "Forked the conversation");
+        // Named for what was made, not what it came from: the fork carries the
+        // snapshot's name, so naming the source here reports the wrong conversation.
+        toast.success(forked.name ? `Forked into “${forked.name}”` : "Forked the conversation");
         navigate(links?.chat?.({ id: forked.id }) ?? agentUrl.chat({ id: forked.id }));
       } catch (cause: unknown) {
         const reason = cause instanceof Error ? cause.message : String(cause);
@@ -279,13 +309,7 @@ export function AgentChatPage() {
         toast.error(`Could not fork: ${reason}`);
       }
     },
-    [
-      instance.data?.name,
-      autoTitle,
-      invalidateConversations,
-      links,
-      navigate,
-    ],
+    [invalidateConversations, links, navigate],
   );
 
   /**
@@ -544,8 +568,6 @@ export function AgentChatPage() {
             instance={instance.data}
             instances={instances}
             autoTitle={autoTitle}
-            pendingState={pendingState}
-            pendingOperation={pendingOperation}
             // Only the chat needs to know: deleting the conversation it is showing
             // leaves it on an address that no longer resolves.
             onDeleted={(target) => {
@@ -684,7 +706,11 @@ export function AgentChatPage() {
           <ChatTranscript
             chat={chat}
             sessionId={id}
+            onOpenCheckpoint={openSnapshot}
+            onRenameCheckpoint={renameSnapshot}
             onFork={forkCheckpoint}
+            onDeleteCheckpoint={deleteCheckpoint}
+            checkpointsById={checkpointsById}
             checkpointByMessage={checkpointByMessage}
             // The question is answered in a field inside the transcript, and once it
             // has been, the next thing typed is an ordinary message. The transcript
@@ -738,80 +764,82 @@ export function AgentChatPage() {
           — and find it away next time rather than having to close it on every
           conversation.
 
-          Rendered only once the instance has loaded: the panel's whole content is
-          derived from the template that instance names, so an empty one would be a
-          frame around nothing.
+          Present from the first frame, with only its contents waiting for the instance
+          read: this column and the panel are 288px of the row, so gating them on that
+          read shifts the conversation sideways when the record lands.
         */}
-        {instance.data ? (
-          <>
-            {/* One control that stays put and changes its icon, mirroring the rail's
-                across the transcript. */}
-            <div
-              css={{
-                flexShrink: 0,
-                position: "sticky",
-                top: theme.layout.headerHeight + 24,
-                alignSelf: "start",
-                marginInlineEnd: isContextOpen ? -theme.space(2) : 0,
-                transition: "margin-inline-end 180ms ease",
-              }}
-            >
-              <Button
-                type="text"
-                size="small"
-                css={iconControlStyles(theme)}
-                icon={
-                  isContextOpen ? (
-                    <PanelRightClose size={16} aria-hidden />
-                  ) : (
-                    <PanelRightOpen size={16} aria-hidden />
-                  )
-                }
-                onClick={toggleContext}
-                aria-label={
-                  isContextOpen ? "Hide the agent panel" : "Show the agent panel"
-                }
-                data-testid={
-                  isContextOpen ? "chat-context-collapse" : "chat-context-expand"
-                }
-              />
-            </div>
+        <div
+          css={{
+            flexShrink: 0,
+            position: "sticky",
+            top: `var(--agent-rail-sticky-top, ${theme.layout.headerHeight + 24}px)`,
+            alignSelf: "start",
+            marginInlineEnd: isContextOpen ? -theme.space(2) : 0,
+            transition: "margin-inline-end 180ms ease",
+            /* Hidden rather than absent, so it keeps its place in the row while there
+               is nothing yet to show or hide. `visibility` also takes it out of the
+               accessibility tree and off the focus order, which `opacity` would not. */
+            visibility: instance.data ? "visible" : "hidden",
+          }}
+        >
+          <Button
+            type="text"
+            size="small"
+            css={iconControlStyles(theme)}
+            icon={
+              isContextOpen ? (
+                <PanelRightClose size={16} aria-hidden />
+              ) : (
+                <PanelRightOpen size={16} aria-hidden />
+              )
+            }
+            onClick={toggleContext}
+            aria-label={isContextOpen ? "Hide the agent panel" : "Show the agent panel"}
+            data-testid={isContextOpen ? "chat-context-collapse" : "chat-context-expand"}
+          />
+        </div>
 
-            {/* Slides rather than vanishing, for the same reason the rail does: an
-                unmounted panel makes the transcript jump its whole width in one frame,
-                which reads as a layout fault rather than as something closing. */}
+        {/* Slides rather than vanishing, for the same reason the rail does: an
+            unmounted panel makes the transcript jump its whole width in one frame,
+            which reads as a layout fault rather than as something closing. */}
+        <div
+          css={{
+            flexShrink: 0,
+            // Nothing to hold space for when the conversation could not be read: the
+            // panel draws from the instance, and the toggle beside it is hidden, so the
+            // reader would be left with an empty column they cannot collapse.
+            width: isContextOpen && !instance.error ? 248 : 0,
+            overflow: "hidden",
+            // Sticky on the wrapper, not on the panel inside it: a sticky element
+            // travels within its parent's box, and this wrapper is exactly as tall
+            // as the panel. See the rail, which had the same fault.
+            position: "sticky",
+            top: `var(--agent-rail-sticky-top, ${theme.layout.headerHeight + 24}px)`,
+            alignSelf: "start",
+            /* Hidden for real once closed rather than clipped to zero width — a
+               child of a zero-width box still has a bounding box. Delayed by the
+               width transition when closing, immediate when opening. */
+            visibility: isContextOpen ? "visible" : "hidden",
+            transition: `width 180ms ease, visibility 0s linear ${isContextOpen ? "0s" : "180ms"}`,
+          }}
+          aria-hidden={!isContextOpen}
+        >
+          {/* The panel's own content is what waits for the read: it is derived from the
+              template the instance names, so an empty one would be a frame around
+              nothing. The box holding it keeps its width either way. */}
+          {instance.data ? (
+            /* No drag handle. The panel had one, and the wrapper above clips to a
+               fixed 248 with `overflow: hidden` — so dragging widened the aside
+               inside a box that never grew, and the only visible effect was a grab
+               cursor on an edge that did nothing. */
             <div
-              css={{
-                flexShrink: 0,
-                width: isContextOpen ? 248 : 0,
-                overflow: "hidden",
-                // Sticky on the wrapper, not on the panel inside it: a sticky element
-                // travels within its parent's box, and this wrapper is exactly as tall
-                // as the panel. See the rail, which had the same fault.
-                position: "sticky",
-                top: theme.layout.headerHeight + 24,
-                alignSelf: "start",
-                /* Hidden for real once closed rather than clipped to zero width — a
-                   child of a zero-width box still has a bounding box. Delayed by the
-                   width transition when closing, immediate when opening. */
-                visibility: isContextOpen ? "visible" : "hidden",
-                transition: `width 180ms ease, visibility 0s linear ${isContextOpen ? "0s" : "180ms"}`,
-              }}
-              aria-hidden={!isContextOpen}
+              data-testid="chat-context-aside"
+              css={{ width: 248, maxHeight: "calc(100vh - 160px)", overflowY: "auto" }}
             >
-              {/* No drag handle. The panel had one, and the wrapper above clips to a
-                  fixed 248 with `overflow: hidden` — so dragging widened the aside
-                  inside a box that never grew, and the only visible effect was a grab
-                  cursor on an edge that did nothing. */}
-              <div
-                data-testid="chat-context-aside"
-                css={{ width: 248, maxHeight: "calc(100vh - 160px)", overflowY: "auto" }}
-              >
-                <AgentContextPanel agent={instance.data} />
-              </div>
+              <AgentContextPanel agent={instance.data} />
             </div>
-          </>
-        ) : null}
+          ) : null}
+        </div>
       </div>
 
       <ConversationDetailsModal
@@ -819,6 +847,38 @@ export function AgentChatPage() {
         open={isShowingDetails}
         onClose={() => setShowingDetails(false)}
       />
+
+      {/* Mounted only while a snapshot is open, so the rename box inside it seeds from
+          the record rather than from whichever snapshot was opened first. */}
+      {openCheckpoint && id ? (
+        <SnapshotDetailsModal
+          checkpoint={openCheckpoint}
+          instanceId={id}
+          onClose={() => setOpenCheckpoint(undefined)}
+          onFork={forkCheckpoint}
+          onDelete={deleteCheckpoint}
+          onRenamed={(renamed) => {
+            setOpenCheckpoint(renamed);
+            // The line on the transcript and anything else reading the list, which
+            // this modal no longer waits on.
+            return checkpoints.refresh();
+          }}
+        />
+      ) : null}
+
+      {/* Mounted only while open, so the box seeds from the record it is for. */}
+      {renamingCheckpoint ? (
+        <SnapshotRenameDialog
+          checkpoint={renamingCheckpoint}
+          onClose={() => setRenamingCheckpoint(undefined)}
+          onRenamed={() => {
+            setRenamingCheckpoint(undefined);
+            // The line on the transcript reads the list, so it is the list that has to
+            // hear about the new name.
+            return checkpoints.refresh();
+          }}
+        />
+      ) : null}
 
       {conversation ? (
         <ShareDialog

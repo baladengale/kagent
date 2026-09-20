@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { Alert, Button, Empty, Skeleton, Tag, Tooltip } from "antd";
 import { ChevronDown } from "lucide-react";
 import { useTheme } from "@emotion/react";
-import type { ChatController, ChatTurnPhase } from "@/api";
+import type { ChatController, ChatTurnPhase, Checkpoint } from "@/api";
 import { AskUserPrompt } from "./AskUserPrompt";
 import { ChatMessageItem } from "./ChatMessageItem";
 import { CheckpointDivider } from "./CheckpointDivider";
@@ -22,6 +22,13 @@ const EMPTY_CHECKPOINTS: ReadonlyMap<string, string> = new Map();
  * halves are not continuous.
  */
 const CHECKPOINT_GAP = 4;
+
+/**
+ * Less below than above, because below it is not the only space there is: the
+ * transcript's own gap to the next message sits under this one, and the two together
+ * read as a hole in the conversation rather than a division in it.
+ */
+const CHECKPOINT_GAP_BELOW = 2;
 
 /**
  * Turn phases worth naming on screen. The rest are transient enough to skip.
@@ -48,12 +55,27 @@ export function ChatTranscript({
   chat,
   sessionId,
   onAnswered,
+  onOpenCheckpoint,
+  onRenameCheckpoint,
   onFork,
+  onDeleteCheckpoint,
+  checkpointsById,
   checkpointByMessage,
 }: {
   chat: ChatController;
-  /** Forks a saved boundary. Absent when read-only. */
+  /**
+   * Opens a saved boundary's record, where its name and the rename live. Absent when
+   * read-only, as the two below are, which leaves the line as a mark and nothing more.
+   */
+  onOpenCheckpoint?: (checkpointId: string) => void;
+  /** Names a boundary, and with it the forks taken from it. */
+  onRenameCheckpoint?: (checkpointId: string) => void;
+  /** Starts a new conversation from a boundary. */
   onFork?: (checkpointId: string) => void;
+  /** Drops a boundary and the runtime stored with it. */
+  onDeleteCheckpoint?: (checkpointId: string) => void;
+  /** The boundaries the controller has described, for the line to name itself by. */
+  checkpointsById?: ReadonlyMap<string, Checkpoint>;
   /** Which boundary each message sits inside, for the messages that sit inside one. */
   checkpointByMessage?: ReadonlyMap<string, string>;
   /**
@@ -341,12 +363,16 @@ export function ChatTranscript({
                   // conversation from the box used to continue it.
                   marginBlockStart: theme.space(CHECKPOINT_GAP),
                   marginBlockEnd:
-                    index === groups.length - 1 ? 0 : theme.space(CHECKPOINT_GAP),
+                    index === groups.length - 1 ? 0 : theme.space(CHECKPOINT_GAP_BELOW),
                 }}
               >
                 <CheckpointDivider
                   checkpointId={checkpointId}
+                  checkpoint={checkpointsById?.get(checkpointId)}
+                  onOpen={onOpenCheckpoint && (() => onOpenCheckpoint(checkpointId))}
                   onFork={onFork && (() => onFork(checkpointId))}
+                  onRename={onRenameCheckpoint && (() => onRenameCheckpoint(checkpointId))}
+                  onDelete={onDeleteCheckpoint && (() => onDeleteCheckpoint(checkpointId))}
                 />
               </div>,
             );

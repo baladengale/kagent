@@ -445,8 +445,23 @@ export function saveAgentInstance(row: AgentInstance): AgentInstance {
 export interface MockCheckpoint {
   id: string;
   agentInstanceId: string;
+  /** Never empty, as the controller's column is not. See `generatedCheckpointName`. */
+  name: string;
   headTaskId: string;
   createdAt: string;
+}
+
+/**
+ * What the controller calls a boundary nobody has named.
+ *
+ * Its shape matters, not just its uniqueness: it is what a fork of an unnamed boundary
+ * is titled, so a fixture inventing something friendlier would show a conversation list
+ * this backend never produces. Mirrors `defaultCheckpointName` in the controller.
+ */
+export function generatedCheckpointName(
+  row: Pick<MockCheckpoint, "agentInstanceId" | "headTaskId">,
+): string {
+  return `${row.agentInstanceId}-${row.headTaskId}`;
 }
 
 /**
@@ -458,22 +473,87 @@ export interface MockCheckpoint {
 export const SEEDED_CHECKPOINT: MockCheckpoint = {
   id: "3f5b1c88-91d2-4a0e-b7c6-5d1f0a2e9b34",
   agentInstanceId: "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44",
+  name: "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44-seed-task-1",
   headTaskId: "seed-task-1",
   createdAt: "2025-01-04T10:15:00Z",
 };
 
-const checkpoints: MockCheckpoint[] = [SEEDED_CHECKPOINT];
+/**
+ * A second seeded boundary, there to be deleted.
+ *
+ * On another conversation, so deleting it races nothing that forks the seeded one —
+ * the fixture suite runs every operation at once.
+ */
+export const DISPOSABLE_CHECKPOINT: MockCheckpoint = {
+  id: "8c2d9f14-6b03-4e77-90a5-1c7e3b8d2f60",
+  agentInstanceId: "2b6e0c45-8a71-4f39-9d02-3c85f1a7e6d0",
+  name: "2b6e0c45-8a71-4f39-9d02-3c85f1a7e6d0-seed-task-2",
+  headTaskId: "seed-task-2",
+  createdAt: "2025-01-04T10:20:00Z",
+};
+
+/**
+ * Kept in `sessionStorage`, beside the transcripts.
+ *
+ * A module array would have brought a deleted boundary back on reload while the
+ * controller keeps it gone — the fixture contradicting what it stands in for. `null`
+ * means "never written", so a tab that has deleted the seeded rows keeps them deleted.
+ */
+const CHECKPOINTS_KEY = "kagent.mock.checkpoints";
+
+function readAll(): MockCheckpoint[] {
+  try {
+    const stored = window.sessionStorage.getItem(CHECKPOINTS_KEY);
+    if (stored === null) return [SEEDED_CHECKPOINT, DISPOSABLE_CHECKPOINT];
+    return JSON.parse(stored) as MockCheckpoint[];
+  } catch {
+    return [];
+  }
+}
+
+function writeAll(rows: MockCheckpoint[]): void {
+  try {
+    window.sessionStorage.setItem(CHECKPOINTS_KEY, JSON.stringify(rows));
+  } catch {
+    // Storage can be refused; the list is then whatever this load seeded, which is
+    // the same answer as a tab that has saved nothing.
+  }
+}
 
 /** Every boundary saved against one conversation. */
 export function readCheckpoints(agentInstanceId: string): MockCheckpoint[] {
-  return checkpoints.filter((row) => row.agentInstanceId === agentInstanceId);
+  return readAll().filter((row) => row.agentInstanceId === agentInstanceId);
 }
 
 export function checkpointById(id: string): MockCheckpoint | undefined {
-  return checkpoints.find((row) => row.id === id);
+  return readAll().find((row) => row.id === id);
 }
 
 export function saveCheckpoint(row: MockCheckpoint): MockCheckpoint {
-  checkpoints.push(row);
+  writeAll([...readAll(), row]);
   return row;
+}
+
+/**
+ * Retitles one. An empty name restores the generated default, as the controller does.
+ *
+ * Answers the stored row rather than nothing, because after an empty name that row is
+ * the only place the new title exists.
+ */
+export function renameCheckpoint(id: string, name: string): MockCheckpoint | undefined {
+  const rows = readAll();
+  const row = rows.find((saved) => saved.id === id);
+  if (!row) return undefined;
+  const renamed = { ...row, name: name || generatedCheckpointName(row) };
+  writeAll(rows.map((saved) => (saved.id === id ? renamed : saved)));
+  return renamed;
+}
+
+/** Removes one, the way `DeleteCheckpoint` releases the snapshot it was holding. */
+export function deleteCheckpoint(id: string): boolean {
+  const rows = readAll();
+  const kept = rows.filter((row) => row.id !== id);
+  if (kept.length === rows.length) return false;
+  writeAll(kept);
+  return true;
 }

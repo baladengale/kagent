@@ -31,6 +31,8 @@ func (c *Compiler) Compile(ctx context.Context, input *v2translator.HarnessInput
 	if err := requireModels(input.Root); err != nil {
 		return nil, err
 	}
+	telemetryConfig, _ := v2translator.TelemetryConfigFromProcess()
+	traceConfig, logConfig := telemetryConfig.Traces, telemetryConfig.Logs
 	compiled, err := c.config.Build(ctx, input.Root)
 	if err != nil {
 		return nil, err
@@ -38,12 +40,12 @@ func (c *Compiler) Compile(ctx context.Context, input *v2translator.HarnessInput
 	template, harness := input.Root.Template, input.Harness
 	if memory := harness.Spec.Kagent.Memory; memory != nil {
 		name := memory.ModelConfigRef.Name
-		model, err := c.config.BuildModel(ctx, harness.Namespace, name)
+		model, err := c.config.BuildModel(harness.Namespace, name)
 		if err != nil {
 			return nil, fmt.Errorf("resolve memory ModelConfig %q: %w", name, err)
 		}
 		compiled.Config.Memory = &adk.MemoryConfig{TTLDays: memory.TTLDays, Embedding: adk.ModelToEmbeddingConfig(model.Model)}
-		compiled.Models = append(compiled.Models, model.Config)
+		compiled.Models = append(compiled.Models, model.Resolved)
 		compiled.Environment = append(compiled.Environment, model.Environment...)
 		compiled.Egress = append(compiled.Egress, model.Egress...)
 	}
@@ -69,22 +71,30 @@ func (c *Compiler) Compile(ctx context.Context, input *v2translator.HarnessInput
 		corev1.EnvVar{Name: "KAGENT_A2A_GRPC_ADDRESS", Value: "[::]:80"},
 		corev1.EnvVar{Name: "KAGENT_PRE_RESPONSE_TRACE_FLUSH", Value: "true"},
 	)
-	environment = append(environment, v2translator.OtelEnvFromProcess()...)
+	environment = append(environment, telemetryConfig.TraceEnvironment()...)
+	environment = append(environment, telemetryConfig.LogEnvironment()...)
 	environment = adkconfig.DedupeEnv(environment)
 	provenance, err := c.config.BuildProvenance(ctx, harness, compiled.Templates, compiled.Models, environment)
 	if err != nil {
 		return nil, fmt.Errorf("build revision provenance: %w", err)
 	}
-	environment, err = c.config.ResolveEnvironment(ctx, template.Namespace, environment)
+	environment, credentials, err := v2translator.CompileCredentials(input, compiled.Models, environment)
 	if err != nil {
-		return nil, fmt.Errorf("resolve runtime environment: %w", err)
+		return nil, err
+	}
+	if traceConfig.Enabled {
+		compiled.Egress = append(compiled.Egress, traceConfig.Hostname)
+	}
+	if logConfig.Enabled {
+		compiled.Egress = append(compiled.Egress, logConfig.Hostname)
 	}
 	slices.Sort(compiled.Egress)
+	compiled.Egress = slices.Compact(compiled.Egress)
 	return &v2translator.CompileResult{Revision: v2translator.Revision{
 		Namespace: template.Namespace, AgentTemplateName: template.Name, HarnessName: harness.Name,
 		Image: harness.Spec.Workload.Image, Environment: environment, ConfigJSON: configJSON, AgentCard: card,
 		WorkerPoolName: harness.Spec.Substrate.WorkerPoolRef.Name, SnapshotLocation: harness.Spec.Substrate.SnapshotPolicy.Location,
-		Provenance: provenance, EgressDestinations: slices.Compact(compiled.Egress),
+		Credentials: credentials, Provenance: provenance, EgressDestinations: compiled.Egress,
 	}}, nil
 }
 

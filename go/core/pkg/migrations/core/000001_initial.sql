@@ -36,6 +36,7 @@ CREATE TABLE runtime_revision (
     harness_uid              TEXT        NOT NULL,
     source_snapshot          JSONB       NOT NULL,
     egress_destinations      TEXT[]      NOT NULL DEFAULT '{}',
+    credentials              JSONB       NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(credentials) = 'array'),
     actor_template_atespace  TEXT        CONSTRAINT runtime_revision_actor_template_namespace_not_null NOT NULL,
     actor_template_name      TEXT        NOT NULL,
     actor_template_uid       TEXT        NOT NULL DEFAULT '',
@@ -87,7 +88,6 @@ CREATE TABLE agent_instance_checkpoint (
     data                   BYTEA       NOT NULL,
     source_history_id      UUID        NOT NULL REFERENCES a2a_context(id) ON DELETE RESTRICT,
     prepared_revision      TEXT        REFERENCES runtime_revision(revision) ON DELETE RESTRICT,
-    source_name            TEXT        NOT NULL DEFAULT '',
     CHECK (snapshot_content_scope IN ('FULL', 'DATA')),
     CHECK (state IN ('CREATING', 'READY', 'FAILED', 'DELETING')),
     UNIQUE (user_id, request_id)
