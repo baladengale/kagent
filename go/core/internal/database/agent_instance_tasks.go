@@ -21,6 +21,17 @@ import (
 // or idle lifecycle operation currently owns the instance.
 var ErrDispatchBusy = errors.New("instance temporarily unavailable for dispatch")
 
+// taskReclaimBound is how long an active task may go without reporting
+// progress before a dispatch may reclaim the one-active-task slot. Turns
+// persist SUBMITTED and WORKING transitions within seconds of starting, so
+// only a writer that stopped reporting — rollout, OOM kill, dropped stream —
+// can still be non-terminal past this bound.
+const taskReclaimBound = 10 * time.Minute
+
+// taskInterruptedMessage explains a task terminated because the process
+// running it stopped reporting progress.
+const taskInterruptedMessage = "The turn was interrupted before it completed, and the process running it is no longer reporting progress."
+
 // ReserveAgentInstanceDispatch prevents pause/suspend between routing a request
 // and its first persisted task. The attempt expires after two minutes; a late
 // first save must fail before native execution. This is not a native work lease.
@@ -33,16 +44,17 @@ func (c *Client) ReserveAgentInstanceDispatch(ctx context.Context, instanceID st
 		if instance.State != "AGENT_INSTANCE_STATE_READY" || instance.Operation != "AGENT_INSTANCE_OPERATION_UNSPECIFIED" {
 			return ErrConflict
 		}
-		blocked, err := queryOne(ctx, tx, `
-			SELECT EXISTS (SELECT 1 FROM agent_instance_task WHERE history_id = $1
-			    AND state IN ('TASK_STATE_SUBMITTED', 'TASK_STATE_WORKING'))
-			    OR EXISTS (SELECT 1 FROM agent_instance_checkpoint WHERE source_instance_id = $2 AND state = 'CREATING')
-		`, pgx.RowTo[bool], instance.HistoryID, instance.ID)
+		creating, err := queryOne(ctx, tx, `
+			SELECT EXISTS (SELECT 1 FROM agent_instance_checkpoint WHERE source_instance_id = $1 AND state = 'CREATING')
+		`, pgx.RowTo[bool], instance.ID)
 		if err != nil {
 			return err
 		}
-		if blocked {
+		if creating {
 			return ErrConflict
+		}
+		if err := reclaimStaleAgentInstanceTask(ctx, tx, instance); err != nil {
+			return err
 		}
 		if err := requireSettledRuntime(ctx, tx, instance.HistoryID, ""); err != nil {
 			if errors.Is(err, ErrFailedPrecondition) {
@@ -55,6 +67,58 @@ func (c *Client) ReserveAgentInstanceDispatch(ctx context.Context, instanceID st
 			WHERE id = $1
 		`, instance.ID, dispatchID)
 	})
+}
+
+// reclaimStaleAgentInstanceTask frees the one-active-task slot when the
+// instance's non-terminal task has not reported progress within
+// taskReclaimBound, terminating it as failed in the caller's transaction. The
+// instance row lock serializes the takeover against the task's own writer, so
+// a task that is still running can never be reclaimed.
+func reclaimStaleAgentInstanceTask(ctx context.Context, tx pgx.Tx, instance agentInstanceRow) error {
+	active, err := queryOne(ctx, tx, `
+		SELECT history_id, id, state, status_timestamp, data, created_at, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position FROM agent_instance_task
+		WHERE history_id = $1 AND state IN ('TASK_STATE_SUBMITTED', 'TASK_STATE_WORKING')
+		FOR UPDATE
+	`, pgx.RowToStructByName[agentInstanceTaskRow], instance.HistoryID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	blocked := fmt.Errorf("AgentInstance %s already has an active task: %w", instance.ID, ErrConflict)
+	progressed := active.StatusTimestamp
+	if progressed == nil {
+		progressed = &active.CreatedAt
+	}
+	if time.Since(*progressed) < taskReclaimBound {
+		return blocked
+	}
+	task, err := unmarshalAgentInstanceTask(active.Data)
+	if err != nil {
+		// An unreadable payload cannot be transitioned safely; keep the slot
+		// reserved rather than corrupting it.
+		return blocked
+	}
+	interrupted := a2a.NewMessageForTask(a2a.MessageRoleAgent, task, a2a.NewTextPart(taskInterruptedMessage))
+	now := time.Now()
+	task.History = append(task.History, interrupted)
+	task.Status = a2a.TaskStatus{State: a2a.TaskStateFailed, Message: interrupted, Timestamp: &now}
+	wire, err := pbconv.ToProtoTask(task)
+	if err != nil {
+		return fmt.Errorf("convert reclaimed AgentInstance task %s: %w", active.ID, err)
+	}
+	data, err := proto.Marshal(wire)
+	if err != nil {
+		return fmt.Errorf("marshal reclaimed AgentInstance task %s: %w", active.ID, err)
+	}
+	if err := execSQL(ctx, tx, `
+		UPDATE agent_instance_task SET state = $3, status_timestamp = $4, data = $5
+		WHERE history_id = $1 AND id = $2
+	`, instance.HistoryID, active.ID, string(task.Status.State), task.Status.Timestamp, data); err != nil {
+		return fmt.Errorf("terminate stale AgentInstance task %s: %w", active.ID, err)
+	}
+	return storeAgentInstanceTaskMessages(ctx, tx, instance.HistoryID, active.ID, instance.ContextID.String(), []*a2a.Message{interrupted})
 }
 
 // RevokeAgentInstanceDispatch fences an unused attempt. True proves its first

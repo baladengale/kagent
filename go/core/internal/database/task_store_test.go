@@ -378,6 +378,41 @@ func TestDispatchFencesIdleWorkAndLateAcceptance(t *testing.T) {
 	require.ErrorIs(t, client.ReserveAgentInstanceDispatch(ctx, instance.Id, uuid.New()), ErrConflict)
 }
 
+func TestDispatchReclaimsStaleActiveTask(t *testing.T) {
+	client := NewClient(setupTestDB(t))
+	ctx := t.Context()
+	agentInstanceFixture(t, client, ctx, "team-a", "revision", "assistant", "kagent")
+	instance, waiting := waitingTaskFixture(t, client)
+
+	// A turn whose writer stopped — rollout, OOM kill, dropped stream — leaves
+	// the slot non-terminal with no further status updates.
+	_, err := client.db.Exec(ctx, `
+		UPDATE agent_instance_task SET state = 'TASK_STATE_WORKING', status_timestamp = clock_timestamp() - INTERVAL '1 hour'
+		WHERE id = $1
+	`, string(waiting.ID))
+	require.NoError(t, err)
+
+	dispatchID := uuid.New()
+	require.NoError(t, client.ReserveAgentInstanceDispatch(ctx, instance.Id, dispatchID))
+
+	stale, err := client.GetAgentInstanceTask(ctx, instance.Id, string(waiting.ID), nil)
+	require.NoError(t, err)
+	require.Equal(t, a2a.TaskStateFailed, stale.Status.State)
+	require.NotNil(t, stale.Status.Message)
+
+	revoked, err := client.RevokeAgentInstanceDispatch(ctx, instance.Id, dispatchID, "new-input")
+	require.NoError(t, err)
+	require.True(t, revoked)
+
+	// A task that is still reporting progress keeps the slot reserved.
+	_, err = client.db.Exec(ctx, `
+		UPDATE agent_instance_task SET state = 'TASK_STATE_WORKING', status_timestamp = clock_timestamp()
+		WHERE id = $1
+	`, string(waiting.ID))
+	require.NoError(t, err)
+	require.ErrorIs(t, client.ReserveAgentInstanceDispatch(ctx, instance.Id, uuid.New()), ErrConflict)
+}
+
 func TestDispatchExpiryRejectsLateSave(t *testing.T) {
 	client := NewClient(setupTestDB(t))
 	ctx := t.Context()
