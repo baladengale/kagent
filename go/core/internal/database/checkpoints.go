@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
@@ -14,11 +15,19 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+var (
+	// ErrCheckpointAdvanced requires the caller to select a new terminal task.
+	ErrCheckpointAdvanced = fmt.Errorf("conversation advanced beyond the expected task: %w", ErrFailedPrecondition)
+	// ErrSnapshotPending permits retrying the same checkpoint request and task.
+	ErrSnapshotPending = fmt.Errorf("snapshot for the expected task is not ready: %w", ErrFailedPrecondition)
+)
+
 // ForkAgentInstance atomically creates an instance and independent history from an owned
 // READY checkpoint, replaying only events through its saved boundary. The fork retains the
 // source context ID, revision, and snapshot reference. A repeated owner/requestID returns
 // the existing fork for the same checkpoint, or ErrIdempotencyConflict otherwise. The
-// boolean reports creation; callers provision the runtime separately.
+// boolean reports creation; callers provision the runtime separately. A deleted
+// fork returns ErrFailedPrecondition and retains its request identity.
 func (c *Client) ForkAgentInstance(ctx context.Context, checkpointID, userID, requestID, instanceID string) (*apiv1alpha1.AgentInstance, bool, error) {
 	checkpointUUID, err := uuid.Parse(checkpointID)
 	if err != nil {
@@ -31,6 +40,9 @@ func (c *Client) ForkAgentInstance(ctx context.Context, checkpointID, userID, re
 			return nil, false, ErrIdempotencyConflict
 		}
 		instance, err := toAgentInstance(existing)
+		if err == nil && instance.State == apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_DELETED {
+			return nil, false, ErrFailedPrecondition
+		}
 		return instance, false, err
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -90,7 +102,7 @@ func (c *Client) ForkAgentInstance(ctx context.Context, checkpointID, userID, re
 		}
 		// The fork owns the retained Tag, not the source's replaceable snapshot.
 		boundaryEvent := &events[len(events)-1]
-		if boundaryEvent.TaskID == nil || *boundaryEvent.TaskID != checkpoint.HeadTaskID || boundaryEvent.SnapshotURI == nil {
+		if boundaryEvent.TaskID != checkpoint.HeadTaskID || boundaryEvent.SnapshotURI == nil {
 			return fmt.Errorf("checkpoint runtime boundary is inconsistent")
 		}
 		boundaryEvent.SnapshotAtespace = &checkpoint.SnapshotAtespace
@@ -115,8 +127,6 @@ func (c *Client) ForkAgentInstance(ctx context.Context, checkpointID, userID, re
 				SnapshotURI:          source.SnapshotURI,
 				SnapshotContentScope: source.SnapshotContentScope,
 				TaskPosition:         source.TaskPosition,
-				InitialMessageID:     source.InitialMessageID,
-				RequestHash:          source.RequestHash,
 				CreatedAt:            &source.CreatedAt,
 			})
 			if err != nil {
@@ -145,6 +155,9 @@ func (c *Client) ForkAgentInstance(ctx context.Context, checkpointID, userID, re
 			return nil, false, ErrIdempotencyConflict
 		}
 		instance, err := toAgentInstance(existing)
+		if err == nil && instance.State == apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_DELETED {
+			return nil, false, ErrFailedPrecondition
+		}
 		return instance, false, err
 	}
 	if err != nil {
@@ -154,10 +167,11 @@ func (c *Client) ForkAgentInstance(ctx context.Context, checkpointID, userID, re
 	return instance, err == nil, err
 }
 
-// ReserveAgentInstanceCheckpoint reserves an owned instance's latest quiescent task
-// boundary and returns its snapshot reference atomically. The instance must be READY with
-// no lifecycle operation and a usable snapshot boundary. A repeated owner/requestID
-// returns the same reservation for the same source, or ErrIdempotencyConflict otherwise. A
+// ReserveAgentInstanceCheckpoint captures the terminal task named by HeadTaskId,
+// provided it is still the latest boundary. ErrSnapshotPending permits retry;
+// ErrCheckpointAdvanced requires a new selection. The instance must be READY.
+// A repeated owner/requestID returns the same reservation for the same source
+// and task, or ErrIdempotencyConflict otherwise. A
 // CREATING reservation blocks new task writes and lifecycle operations while the caller
 // retains the external snapshot.
 func (c *Client) ReserveAgentInstanceCheckpoint(ctx context.Context, checkpoint *apiv1alpha1.Checkpoint, userID, requestID string) (*apiv1alpha1.Checkpoint, *AgentInstanceTaskSnapshot, error) {
@@ -173,7 +187,7 @@ func (c *Client) ReserveAgentInstanceCheckpoint(ctx context.Context, checkpoint 
 	err = c.withTx(ctx, func(tx pgx.Tx) error {
 		existing, err := readCheckpointRequest(ctx, tx, userID, requestID)
 		if err == nil {
-			if existing.SourceInstanceID != sourceID {
+			if existing.SourceInstanceID != sourceID || existing.HeadTaskID != checkpoint.HeadTaskId {
 				return ErrIdempotencyConflict
 			}
 			snapshot = checkpointSnapshot(existing)
@@ -185,7 +199,7 @@ func (c *Client) ReserveAgentInstanceCheckpoint(ctx context.Context, checkpoint 
 		}
 
 		instance, err := lockAgentInstance(ctx, tx, checkpoint.GetAgentInstanceId())
-		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (instance.UserID != userID)) {
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (instance.UserID != userID || instance.State == "AGENT_INSTANCE_STATE_DELETED")) {
 			return ErrNotFound
 		}
 		if err != nil {
@@ -198,48 +212,46 @@ func (c *Client) ReserveAgentInstanceCheckpoint(ctx context.Context, checkpoint 
 		if instance.State != "AGENT_INSTANCE_STATE_READY" || instance.Operation != "AGENT_INSTANCE_OPERATION_UNSPECIFIED" {
 			return fmt.Errorf("AgentInstance %s cannot checkpoint in state %s with operation %s: %w", checkpoint.GetAgentInstanceId(), instance.State, instance.Operation, ErrConflict)
 		}
+		type head struct {
+			TaskID   string
+			State    string
+			Sequence int64
+		}
+		current, err := queryOne(ctx, tx, `
+			SELECT e.task_id, t.state, e.sequence FROM agent_instance_task_event e
+			JOIN agent_instance_task t ON t.history_id = e.history_id AND t.id = e.task_id
+			WHERE e.history_id = $1 ORDER BY e.sequence DESC LIMIT 1
+		`, pgx.RowToStructByName[head], instance.HistoryID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrFailedPrecondition
+		}
+		if err != nil {
+			return err
+		}
+		if current.TaskID != checkpoint.HeadTaskId {
+			return ErrCheckpointAdvanced
+		}
+		if !a2a.TaskState(current.State).Terminal() {
+			return fmt.Errorf("checkpoint requires a terminal task: %w", ErrFailedPrecondition)
+		}
+		if err := requireSettledRuntime(ctx, tx, instance.HistoryID, ""); err != nil {
+			if errors.Is(err, ErrFailedPrecondition) {
+				return ErrSnapshotPending
+			}
+			return err
+		}
 		if instance.PreparedRevision != nil {
 			if _, err := getAvailableRuntimeRevisionForUpdate(ctx, tx, *instance.PreparedRevision); err != nil {
 				return err
 			}
 		}
-		boundary, err := queryOne(ctx, tx, `
-			SELECT latest.history_id, latest.id, latest.state, latest.status_timestamp, latest.data, latest.created_at,
-			    latest.updated_at, latest.initial_message_id, latest.request_hash, latest.snapshot_atespace,
-			    latest.snapshot_uri, latest.snapshot_content_scope, latest.history_sequence, latest.position
-			FROM (
-			    SELECT history_id, id, state, status_timestamp, data, created_at, updated_at, initial_message_id, request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position FROM agent_instance_task
-			    WHERE agent_instance_task.history_id = $1
-			    ORDER BY history_sequence DESC NULLS LAST
-			    LIMIT 1
-			) latest
-			WHERE latest.history_sequence = (SELECT MAX(sequence) FROM agent_instance_task_event WHERE history_id = $1)
-			AND latest.state IN (
-			    'TASK_STATE_COMPLETED',
-			    'TASK_STATE_CANCELED',
-			    'TASK_STATE_FAILED',
-			    'TASK_STATE_REJECTED'
-			)
-			AND NOT EXISTS (
-			    SELECT 1 FROM agent_instance_task active
-			    WHERE active.history_id = $1
-			      AND active.state NOT IN (
-			          'TASK_STATE_COMPLETED',
-			          'TASK_STATE_CANCELED',
-			          'TASK_STATE_FAILED',
-			          'TASK_STATE_REJECTED'
-			      )
-			)
-		`, pgx.RowToStructByName[agentInstanceTaskRow], instance.HistoryID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("AgentInstance %s has no quiescent turn boundary: %w", checkpoint.GetAgentInstanceId(), ErrFailedPrecondition)
-		}
+		boundary, err := readAgentInstanceTask(ctx, tx, instance.HistoryID, current.TaskID)
 		if err != nil {
 			return fmt.Errorf("get latest AgentInstance task boundary: %w", err)
 		}
 		if boundary.SnapshotAtespace == nil || boundary.SnapshotURI == nil ||
-			boundary.SnapshotContentScope == nil || boundary.HistorySequence == nil {
-			return fmt.Errorf("AgentInstance %s has no quiescent turn boundary: %w", checkpoint.GetAgentInstanceId(), ErrFailedPrecondition)
+			boundary.SnapshotContentScope == nil || boundary.HistorySequence == nil || *boundary.HistorySequence != current.Sequence {
+			return ErrSnapshotPending
 		}
 
 		value := proto.Clone(checkpoint).(*apiv1alpha1.Checkpoint)
@@ -443,7 +455,7 @@ func (c *Client) BeginDeleteAgentInstanceCheckpoint(ctx context.Context, id, use
 			WHERE agent_instance_checkpoint.id = $1 AND agent_instance_checkpoint.user_id = $2
 			  AND agent_instance_checkpoint.state IN ('READY', 'DELETING')
 			  AND NOT EXISTS (
-			      SELECT 1 FROM agent_instance i WHERE i.source_checkpoint_id = agent_instance_checkpoint.id
+			      SELECT 1 FROM agent_instance i WHERE i.pinned_checkpoint_id = agent_instance_checkpoint.id
 			  )
 		`, row.ID, userID, data)
 		if err != nil {
@@ -579,7 +591,7 @@ func lockCheckpoint(ctx context.Context, db pgx.Tx, id string, allUsers bool, us
 func readCheckpointEvents(ctx context.Context, db dbExecutor, checkpointID uuid.UUID) ([]agentInstanceTaskEventRow, error) {
 	return queryMany(ctx, db, `
 		SELECT e.sequence, e.history_id, e.task_id, e.data, e.created_at, e.message_id, e.task_position,
-		    e.initial_message_id, e.request_hash, e.snapshot_atespace, e.snapshot_uri, e.snapshot_content_scope
+		    e.snapshot_atespace, e.snapshot_uri, e.snapshot_content_scope
 		FROM agent_instance_checkpoint c
 		JOIN agent_instance_task_event e
 		  ON e.history_id = c.source_history_id
@@ -590,18 +602,18 @@ func readCheckpointEvents(ctx context.Context, db dbExecutor, checkpointID uuid.
 }
 
 // insertReplayedTask restores a task projection with its original ordering, timestamps,
-// retry metadata, and snapshot boundary. Callers provide the destination history and
+// and snapshot boundary. Callers provide the destination history and
 // transaction after validating the replay.
 func insertReplayedTask(ctx context.Context, db dbExecutor, task agentInstanceTaskRow) error {
 	return execSQL(ctx, db, `
 		INSERT INTO agent_instance_task (
-		    history_id, id, state, status_timestamp, data, created_at, updated_at,
-		    initial_message_id, request_hash, snapshot_atespace, snapshot_uri,
+		    history_id, id, state, status_timestamp, data, created_at,
+		    snapshot_atespace, snapshot_uri,
 		    snapshot_content_scope, history_sequence, position
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`,
-		task.HistoryID, task.ID, task.State, task.StatusTimestamp, task.Data, task.CreatedAt, task.UpdatedAt,
-		task.InitialMessageID, task.RequestHash, task.SnapshotAtespace, task.SnapshotURI,
+		task.HistoryID, task.ID, task.State, task.StatusTimestamp, task.Data, task.CreatedAt,
+		task.SnapshotAtespace, task.SnapshotURI,
 		task.SnapshotContentScope, task.HistorySequence, task.Position,
 	)
 }

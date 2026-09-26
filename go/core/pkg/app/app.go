@@ -39,16 +39,22 @@ import (
 	prompttemplateservice "github.com/kagent-dev/kagent/go/core/internal/service/prompttemplate"
 	"github.com/kagent-dev/kagent/go/core/internal/service/scheduledrun"
 	systemservice "github.com/kagent-dev/kagent/go/core/internal/service/system"
+	"github.com/kagent-dev/kagent/go/core/internal/service/taskstore"
 	toolservice "github.com/kagent-dev/kagent/go/core/internal/service/tool"
 	"github.com/kagent-dev/kagent/go/core/internal/substrate"
-	"github.com/kagent-dev/kagent/go/core/internal/telemetry"
 	v2translator "github.com/kagent-dev/kagent/go/core/internal/translator"
 	"github.com/kagent-dev/kagent/go/core/internal/version"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	kagentenv "github.com/kagent-dev/kagent/go/core/pkg/env"
 	"github.com/kagent-dev/kagent/go/core/pkg/migrations"
 	"github.com/kagent-dev/kagent/go/pkg/logging"
+	"github.com/kagent-dev/kagent/go/pkg/telemetry"
 	kmcp "github.com/kagent-dev/kmcp/api/v1alpha1"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	otelprometheus "go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
@@ -60,6 +66,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -156,17 +164,27 @@ func Run(ctx context.Context, opts Options) error {
 	for _, warning := range telemetryWarnings {
 		logger.WarnContext(ctx, "invalid agent telemetry configuration; disabling signal", "error", warning)
 	}
-	// otelgrpc snapshots the global TracerProvider and propagator when its handler
-	// is constructed, so tracing has to be registered before any server is built.
-	shutdownTracing, err := telemetry.InitTracerProvider(ctx, version.Version)
+	telemetryOptions := telemetry.Options{Defaults: []attribute.KeyValue{
+		semconv.ServiceName("kagent-controller"), semconv.ServiceNamespace("kagent"), semconv.ServiceVersion(version.Version),
+	}}
+	if metricsBindAddress() != "0" {
+		reader, err := otelprometheus.New(otelprometheus.WithRegisterer(crmetrics.Registry))
+		if err != nil {
+			return fmt.Errorf("create Prometheus metric reader: %w", err)
+		}
+		telemetryOptions.MetricReaders = []sdkmetric.Reader{reader}
+	}
+	// otelgrpc snapshots the global providers and propagator when its handler is
+	// constructed, so telemetry has to be registered before any server is built.
+	providers, err := telemetry.Init(ctx, telemetryOptions)
 	if err != nil {
-		return fmt.Errorf("initialize tracing: %w", err)
+		logger.ErrorContext(ctx, "failed to initialize telemetry", "error", err)
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := shutdownTracing(shutdownCtx); err != nil {
-			logger.ErrorContext(shutdownCtx, "failed to shut down tracing", "error", err)
+		if err := providers.Shutdown(shutdownCtx); err != nil {
+			logger.ErrorContext(shutdownCtx, "failed to shut down telemetry", "error", err)
 		}
 	}()
 
@@ -216,11 +234,21 @@ func Run(ctx context.Context, opts Options) error {
 		// Forbidden response without a failing Namespace informer blocking startup.
 		managerClientOptions.Cache = &client.CacheOptions{DisableFor: []client.Object{&corev1.Namespace{}}}
 	}
+	metricsOptions := metricsserver.Options{
+		BindAddress:   metricsBindAddress(),
+		SecureServing: kagentenv.MetricsSecure.Get(),
+	}
+	if metricsOptions.SecureServing {
+		// SecureServing alone only encrypts. The filter authenticates the scraper
+		// with a TokenReview and authorizes it with a SubjectAccessReview on the
+		// /metrics nonResourceURL.
+		metricsOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
 	manager, err := ctrl.NewManager(kubeConfig, ctrl.Options{
 		Scheme:                  managerScheme,
 		Cache:                   managerCacheOptions,
 		Client:                  managerClientOptions,
-		Metrics:                 metricsserver.Options{BindAddress: "0"},
+		Metrics:                 metricsOptions,
 		LeaderElection:          kagentenv.LeaderElect.Get(),
 		LeaderElectionID:        "0e9f6799.kagent.dev",
 		LeaderElectionNamespace: env("KAGENT_NAMESPACE", "kagent"),
@@ -275,6 +303,10 @@ func Run(ctx context.Context, opts Options) error {
 	system := systemservice.NewService(manager.GetClient(), watchNamespaces, authorizer, actors)
 	memory := memoryservice.NewService(store)
 	instanceWorkflow := agentinstance.NewActorWorkflow(store, actors)
+	runtimeTasks := taskstore.NewService(store)
+	if err := manager.Add(instanceWorkflow); err != nil {
+		return fmt.Errorf("register idle instance worker: %w", err)
+	}
 	instances := agentinstance.NewService(store, authorizer, instanceWorkflow)
 	checkpoints := checkpoint.NewService(store, authorizer, actors, instanceWorkflow)
 	gatewayDialer, err := a2agateway.NewRuntimeDialer(
@@ -284,7 +316,7 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	gateway := a2agateway.New(store, authorizer, gatewayDialer, instanceWorkflow,
+	gateway := a2agateway.New(store, authorizer, gatewayDialer,
 		env("KAGENT_GATEWAY_URL", "http://127.0.0.1:8083"))
 	schedules := scheduledrun.NewService(store, manager.GetClient(), authorizer)
 	if err := manager.Add(scheduledruncontroller.NewScheduler(store)); err != nil {
@@ -306,19 +338,22 @@ func Run(ctx context.Context, opts Options) error {
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.Handle("/mcp", auth.AuthnMiddleware(authenticator)(mcpHandler))
+	mux.Handle("/mcp", otelhttp.NewHandler(auth.AuthnMiddleware(authenticator)(mcpHandler), "/mcp"))
+	mux.Handle(a2agateway.HTTPPathPrefix, otelhttp.NewHandler(a2agateway.NewHTTPHandler(gateway, authenticator, store), a2agateway.HTTPPathPrefix))
 	server, err := grpcserver.New(grpcserver.Config{
 		MethodPolicies:        policies,
 		RegisterServices:      opts.GRPCServices,
 		BindAddress:           env("HTTP_BIND_ADDRESS", ":8083"),
 		Reflection:            envBool("GRPC_REFLECTION"),
 		Authenticator:         authenticator,
+		RuntimeAuthenticator:  &taskstore.Authenticator{},
 		ShareStore:            store,
 		ModelService:          models,
 		ToolService:           tools,
 		PromptTemplateService: prompts,
 		SystemService:         system,
 		MemoryService:         memory,
+		TaskStoreService:      runtimeTasks,
 		AgentInstanceService:  instances,
 		ScheduledRunService:   schedules,
 		// Both halves of the pair CreateAgentInstance names. Without these two
@@ -367,6 +402,16 @@ func env(name, fallback string) string {
 func envBool(name string) bool {
 	value, _ := strconv.ParseBool(os.Getenv(name))
 	return value
+}
+
+// metricsBindAddress resolves METRICS_BIND_ADDRESS. controller-runtime reads an
+// empty address as "unset" and falls back to :8080, so an empty value would
+// serve metrics on a port nobody asked for. "0" disables the metrics server.
+func metricsBindAddress() string {
+	if address := kagentenv.MetricsBindAddress.Get(); address != "" {
+		return address
+	}
+	return "0"
 }
 
 func namespaces(value string) []string {

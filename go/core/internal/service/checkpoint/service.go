@@ -15,6 +15,7 @@ import (
 	"github.com/kagent-dev/kagent/go/core/internal/substrate"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"golang.org/x/sync/singleflight"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -37,7 +38,7 @@ type store interface {
 }
 
 type workflow interface {
-	Fork(context.Context, *apiv1alpha1.AgentInstance, *database.AgentInstanceTaskSnapshot, string) (*apiv1alpha1.AgentInstance, error)
+	Create(context.Context, *apiv1alpha1.AgentInstance) (*apiv1alpha1.AgentInstance, error)
 }
 
 type tagClient interface {
@@ -48,8 +49,9 @@ type tagClient interface {
 }
 
 type Service struct {
-	// ponytail: coalesce duplicate creates within one controller; use a durable
-	// lease when multi-replica gateway coordination is supported.
+	// creates coalesces identical requests within this service instance.
+	// TODO: route tag creation and cleanup through durable instance ownership
+	// so retries on different replicas cannot race.
 	creates    singleflight.Group
 	store      store
 	authorizer auth.Authorizer
@@ -72,17 +74,20 @@ func NewService(store store, authorizer auth.Authorizer, tags tagClient, workflo
 	return &Service{store: store, authorizer: authorizer, tags: tags, workflow: workflow}
 }
 
-func (s *Service) Create(ctx context.Context, instanceID, requestID string) (*apiv1alpha1.Checkpoint, error) {
+func (s *Service) Create(ctx context.Context, instanceID, requestID, expectedHeadTaskID string) (*apiv1alpha1.Checkpoint, error) {
 	if err := validateCreate(instanceID, requestID); err != nil {
 		return nil, err
+	}
+	if expectedHeadTaskID == "" {
+		return nil, status.Error(codes.InvalidArgument, "expected_head_task_id is required")
 	}
 	userID, err := s.authorize(ctx, auth.VerbCreate, "AgentInstance", instanceID)
 	if err != nil {
 		return nil, err
 	}
-	key := fmt.Sprintf("%q/%q/%q", userID, instanceID, requestID)
+	key := fmt.Sprintf("%q/%q/%q/%q", userID, instanceID, requestID, expectedHeadTaskID)
 	result, err, _ := s.creates.Do(key, func() (any, error) {
-		return s.create(ctx, userID, instanceID, requestID)
+		return s.create(ctx, userID, instanceID, requestID, expectedHeadTaskID)
 	})
 	if err != nil {
 		return nil, err
@@ -90,12 +95,23 @@ func (s *Service) Create(ctx context.Context, instanceID, requestID string) (*ap
 	return result.(*apiv1alpha1.Checkpoint), nil
 }
 
-func (s *Service) create(ctx context.Context, userID, instanceID, requestID string) (*apiv1alpha1.Checkpoint, error) {
+func (s *Service) create(ctx context.Context, userID, instanceID, requestID, expectedHeadTaskID string) (*apiv1alpha1.Checkpoint, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, serviceerrors.NewInternal("Failed to generate checkpoint identifier", err)
 	}
-	checkpoint, snapshot, err := s.store.ReserveAgentInstanceCheckpoint(ctx, &apiv1alpha1.Checkpoint{Id: id.String(), AgentInstanceId: instanceID}, userID, requestID)
+	checkpoint, snapshot, err := s.store.ReserveAgentInstanceCheckpoint(ctx, &apiv1alpha1.Checkpoint{Id: id.String(), AgentInstanceId: instanceID, HeadTaskId: expectedHeadTaskID}, userID, requestID)
+	if errors.Is(err, database.ErrCheckpointAdvanced) || errors.Is(err, database.ErrSnapshotPending) {
+		reason := "KAGENT_CHECKPOINT_CONVERSATION_ADVANCED"
+		if errors.Is(err, database.ErrSnapshotPending) {
+			reason = "KAGENT_CHECKPOINT_SNAPSHOT_PENDING"
+		}
+		failure, detailErr := status.New(codes.FailedPrecondition, err.Error()).WithDetails(&errdetails.ErrorInfo{Domain: "kagent.dev", Reason: reason})
+		if detailErr != nil {
+			return nil, detailErr
+		}
+		return nil, failure.Err()
+	}
 	if errors.Is(err, database.ErrIdempotencyConflict) {
 		return nil, serviceerrors.NewAlreadyExists("request_id was already used for a different checkpoint", err)
 	}
@@ -320,13 +336,22 @@ func (s *Service) Fork(ctx context.Context, checkpointID, requestID string) (*ap
 	if errors.Is(err, database.ErrIdempotencyConflict) {
 		return nil, serviceerrors.NewAlreadyExists("request_id was already used for a different AgentInstance", err)
 	}
+	if errors.Is(err, database.ErrFailedPrecondition) {
+		return nil, serviceerrors.NewFailedPrecondition("request_id belongs to a deleted AgentInstance", err)
+	}
 	if errors.Is(err, database.ErrNotFound) {
 		return nil, serviceerrors.NewNotFound("Checkpoint not found", err)
 	}
 	if err != nil {
 		return nil, serviceerrors.NewInternal("Failed to reserve fork AgentInstance", err)
 	}
-	instance, err = s.workflow.Fork(ctx, instance, snapshot, tagName(checkpointID))
+	instance, err = s.workflow.Create(ctx, instance)
+	if errors.Is(err, database.ErrConflict) {
+		return nil, serviceerrors.NewAborted(err.Error(), err)
+	}
+	if errors.Is(err, database.ErrNotFound) {
+		return nil, serviceerrors.NewNotFound("AgentInstance was deleted", err)
+	}
 	if err != nil {
 		return nil, serviceerrors.NewUnavailable("Failed to create fork AgentInstance", err)
 	}

@@ -17,12 +17,12 @@ The release-blocking harnesses are kagent, Codex, and Claude. Prefer clean-insta
 
 ## 2. Sources of Truth
 
-- The API v2 execution plan is [docs/plans/api-v2-execution-plan.md](docs/plans/api-v2-execution-plan.md).
+- Current architecture is documented in [docs/architecture](docs/architecture).
 - Development workflows and current architecture notes are in [.claude/skills/kagent-dev/SKILL.md](.claude/skills/kagent-dev/SKILL.md).
 - General and language-specific conventions are in [STYLE.md](STYLE.md).
 - Generated code is never the source of truth. Change the API, protobuf, SQL, or schema source and regenerate its outputs.
 
-When documentation and implementation disagree, verify the intended state in the execution plan and current code rather than preserving obsolete behavior.
+When documentation and implementation disagree, verify the intended state against the current task requirements and code rather than preserving obsolete behavior.
 
 ## 3. Code Structure — Make Wrong Code Hard to Write
 
@@ -168,10 +168,11 @@ is signed in correctly reports nobody — there is no backend to have signed in 
 
 An `AppExtensionConfig` contributes navigation entries and overrides, routes and
 route handles, slots, form fields, table columns, API overrides, providers, theme
-tokens, shell regions, branding, provider icons and agent links. Components read
-every colour, radius and font from those tokens, so overriding them restyles
-components an extension never touches. When adding a feature, check whether it
-belongs behind an extension point rather than as a branch inside a shared component.
+tokens, shell regions, branding, provider icons, chat part renderers and agent
+links. Components read every colour, radius and font from those tokens, so
+overriding them restyles components an extension never touches. When adding a
+feature, check whether it belongs behind an extension point rather than as a branch
+inside a shared component.
 
 Several are installed at once, as the ordered `activeAppExtensions` array. Additive
 contributions from every entry take effect in order; singular ones are merged with
@@ -199,4 +200,3 @@ The full guide is [ui/docs/app-extensions.md](ui/docs/app-extensions.md).
 - [DEVELOPMENT.md](DEVELOPMENT.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [docs/architecture](docs/architecture)
-- [docs/plans/api-v2-execution-plan.md](docs/plans/api-v2-execution-plan.md)

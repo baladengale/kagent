@@ -58,15 +58,19 @@ func sameAgentInstanceRequest(instance, request *apiv1alpha1.AgentInstance) bool
 
 // CreateAgentInstance atomically reserves an instance, its conversation history, and the
 // latest successful runtime revision. A repeated creator/requestID returns the existing
-// instance when the harness and template match, or ErrIdempotencyConflict otherwise. The
+// instance when the harness and template match, or ErrIdempotencyConflict otherwise. A
+// deleted instance returns ErrFailedPrecondition and keeps its request ID reserved. The
 // boolean reports whether this call created the instance; runtime provisioning belongs to
 // the caller.
 func (c *Client) CreateAgentInstance(ctx context.Context, request *apiv1alpha1.AgentInstance, requestID string) (*apiv1alpha1.AgentInstance, bool, error) {
 	existing, err := readAgentInstanceRequest(ctx, c.db, request.GetCreator(), requestID)
 	if err == nil {
 		instance, err := toAgentInstance(existing)
-		if err == nil && !sameAgentInstanceRequest(instance, request) {
+		if err == nil && (existing.SourceCheckpointID != nil || !sameAgentInstanceRequest(instance, request)) {
 			return nil, false, ErrIdempotencyConflict
+		}
+		if err == nil && instance.State == apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_DELETED {
+			return nil, false, ErrFailedPrecondition
 		}
 		return instance, false, err
 	}
@@ -85,8 +89,11 @@ func (c *Client) CreateAgentInstance(ctx context.Context, request *apiv1alpha1.A
 			return nil, false, fmt.Errorf("get concurrent AgentInstance request: %w", err)
 		}
 		instance, err := toAgentInstance(existing)
-		if err == nil && !sameAgentInstanceRequest(instance, request) {
+		if err == nil && (existing.SourceCheckpointID != nil || !sameAgentInstanceRequest(instance, request)) {
 			return nil, false, ErrIdempotencyConflict
+		}
+		if err == nil && instance.State == apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_DELETED {
+			return nil, false, ErrFailedPrecondition
 		}
 		return instance, false, err
 	}
@@ -138,7 +145,7 @@ func insertAgentInstance(ctx context.Context, db pgx.Tx, request *apiv1alpha1.Ag
 }
 
 // GetAgentInstanceByID returns an instance without filtering by owner, or ErrNotFound if
-// absent. Callers must authorize access; malformed UUIDs return an error.
+// absent or deleted. Callers must authorize access; malformed UUIDs return an error.
 func (c *Client) GetAgentInstanceByID(ctx context.Context, id string) (*apiv1alpha1.AgentInstance, error) {
 	uid, err := uuid.Parse(id)
 	if err != nil {
@@ -151,12 +158,28 @@ func (c *Client) GetAgentInstanceByID(ctx context.Context, id string) (*apiv1alp
 	return toAgentInstance(row)
 }
 
+// GetAgentInstanceForRuntime binds a verified Substrate actor UID to the
+// instance created for it. Deleted instances and obsolete actors cannot access
+// retained task data. Actor identity is private and is never caller metadata.
+func (c *Client) GetAgentInstanceForRuntime(ctx context.Context, id, actorUID string) (*apiv1alpha1.AgentInstance, error) {
+	row, err := queryOne(ctx, c.db, `
+		SELECT id, user_id, prepared_revision, state, data, operation, context_id,
+		    source_checkpoint_id, history_id, operation_id, executor_id
+		FROM agent_instance WHERE id = $1 AND actor_uid = $2
+		    AND state <> 'AGENT_INSTANCE_STATE_DELETED'
+	`, pgx.RowToStructByName[agentInstanceRow], id, actorUID)
+	if err != nil {
+		return nil, notFoundOr(err)
+	}
+	return toAgentInstance(row)
+}
+
 // GetAgentInstance returns an instance only when it belongs to userID. Missing instances
-// and instances owned by another user return ErrNotFound.
+// and instances owned by another user return ErrNotFound. Tombstones are hidden.
 func (c *Client) GetAgentInstance(ctx context.Context, id, userID string) (*apiv1alpha1.AgentInstance, error) {
 	row, err := queryOne(ctx, c.db, `
 		SELECT id, user_id, prepared_revision, state, data, operation, context_id,
-		    source_checkpoint_id, history_id FROM agent_instance WHERE id = $1 AND user_id = $2
+		    source_checkpoint_id, history_id, operation_id, executor_id FROM agent_instance WHERE id = $1 AND user_id = $2 AND state <> 'AGENT_INSTANCE_STATE_DELETED'
 	`, pgx.RowToStructByName[agentInstanceRow], id, userID)
 	if err != nil {
 		return nil, fmt.Errorf("get AgentInstance %s: %w", id, notFoundOr(err))
@@ -170,9 +193,9 @@ func (c *Client) GetAgentInstance(ctx context.Context, id, userID string) (*apiv
 func (c *Client) ListAgentInstances(ctx context.Context, query AgentInstanceQuery) ([]*apiv1alpha1.AgentInstance, error) {
 	rows, err := queryMany(ctx, c.db, `
 		SELECT i.id, i.user_id, i.prepared_revision, i.state, i.data, i.operation,
-		    i.context_id, i.source_checkpoint_id, i.history_id FROM agent_instance i
+		    i.context_id, i.source_checkpoint_id, i.history_id, i.operation_id, i.executor_id FROM agent_instance i
 		LEFT JOIN runtime_revision r ON r.revision = i.prepared_revision
-		WHERE ($1::boolean OR i.user_id = $2)
+		WHERE i.state <> 'AGENT_INSTANCE_STATE_DELETED' AND ($1::boolean OR i.user_id = $2)
 		  AND (NULLIF($3::text, '') IS NULL OR i.id > NULLIF($3::text, '')::uuid)
 		  AND ($4::text = '' OR (r.agent_template_name = $4 AND r.namespace = $5))
 		  AND ($6::text = '' OR (r.harness_name = $6 AND r.namespace = $7))
@@ -206,7 +229,7 @@ func (c *Client) UpdateAgentInstanceName(ctx context.Context, id, userID, name s
 		if err != nil {
 			return notFoundOr(err)
 		}
-		if row.UserID != userID {
+		if row.UserID != userID || row.State == apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_DELETED.String() {
 			return ErrNotFound
 		}
 		instance, err := toAgentInstance(row)
@@ -239,96 +262,6 @@ func (c *Client) UpdateAgentInstanceName(ctx context.Context, id, userID, name s
 	return result, nil
 }
 
-// TransitionAgentInstance changes lifecycle fields only if the stored state and operation
-// match the expected values. A mismatch, or a creating checkpoint when starting a new
-// operation, returns ErrConflict. Starting explicit Suspend also requires no active task.
-// It preserves other instance fields; callers choose a valid transition and authorize it.
-func (c *Client) TransitionAgentInstance(
-	ctx context.Context,
-	instance *apiv1alpha1.AgentInstance,
-	expectedState apiv1alpha1.AgentInstanceState,
-	expectedOperation apiv1alpha1.AgentInstanceOperation,
-) (*apiv1alpha1.AgentInstance, error) {
-	var result *apiv1alpha1.AgentInstance
-	err := c.withTx(ctx, func(tx pgx.Tx) error {
-		row, err := lockAgentInstance(ctx, tx, instance.GetId())
-		if err != nil {
-			return notFoundOr(err)
-		}
-		result, err = toAgentInstance(row)
-		if err != nil {
-			return err
-		}
-		if result.State != expectedState || result.Operation != expectedOperation {
-			return fmt.Errorf("AgentInstance lifecycle state or operation changed: %w", ErrConflict)
-		}
-		// Only lifecycle fields belong to this operation. Keep concurrent renames,
-		// immutable indexed fields and unknown protobuf fields from the locked row.
-		next := proto.Clone(result).(*apiv1alpha1.AgentInstance)
-		next.State, next.Operation = instance.State, instance.Operation
-		next.A2AAuthority = instance.A2AAuthority
-		next.Failure = instance.Failure
-		next.UpdatedAt = timestamppb.Now()
-		data, err := marshalAgentInstance(next)
-		if err != nil {
-			return err
-		}
-		tag, err := tx.Exec(ctx, `
-			UPDATE agent_instance
-			SET state = $1, operation = $2, data = $3
-			WHERE agent_instance.id = $4
-			  AND agent_instance.state = $5
-			  AND agent_instance.operation = $6
-			  AND (
-			    $6::text <> 'AGENT_INSTANCE_OPERATION_UNSPECIFIED'
-			    OR NOT EXISTS (
-			      SELECT 1 FROM agent_instance_checkpoint c
-			      WHERE c.source_instance_id = agent_instance.id AND c.state = 'CREATING'
-			    )
-			  )
-			  AND (
-			    $2::text <> 'AGENT_INSTANCE_OPERATION_SUSPEND'
-			    OR $6::text <> 'AGENT_INSTANCE_OPERATION_UNSPECIFIED'
-			    OR NOT EXISTS (
-			      SELECT 1 FROM agent_instance_task t
-			      WHERE t.history_id = agent_instance.history_id
-			        AND t.state NOT IN ('TASK_STATE_COMPLETED', 'TASK_STATE_CANCELED',
-			            'TASK_STATE_FAILED', 'TASK_STATE_REJECTED',
-			            'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED')
-			    )
-			  )
-		`,
-			next.State.String(),
-			next.Operation.String(), data, row.ID, expectedState.String(),
-			expectedOperation.String(),
-		)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return fmt.Errorf("AgentInstance %s has an active task or checkpoint being created: %w", instance.GetId(), ErrConflict)
-		}
-		result = next
-		return nil
-	})
-	if err != nil {
-		return result, fmt.Errorf("transition AgentInstance %s: %w", instance.GetId(), err)
-	}
-	return result, nil
-}
-
-// DeleteAgentInstance removes an instance and its shares while retaining conversation
-// history and checkpoints. A missing instance is a no-op. Callers authorize deletion and
-// perform runtime cleanup separately.
-func (c *Client) DeleteAgentInstance(ctx context.Context, id string) error {
-	if err := execSQL(ctx, c.db, `
-		DELETE FROM agent_instance WHERE id = $1
-	`, id); err != nil {
-		return fmt.Errorf("delete AgentInstance %s: %w", id, err)
-	}
-	return nil
-}
-
 type agentInstanceRow struct {
 	ID                 uuid.UUID
 	UserID             string
@@ -338,16 +271,18 @@ type agentInstanceRow struct {
 	Operation          string
 	ContextID          uuid.UUID
 	SourceCheckpointID *uuid.UUID
+	OperationID        *uuid.UUID
+	ExecutorID         *uuid.UUID
 	HistoryID          uuid.UUID
 }
 
 // lockAgentInstance returns an instance locked against concurrent updates until the
 // caller's transaction ends. It does not filter by owner and returns pgx.ErrNoRows if
-// absent.
+// absent. Tombstones are included so lifecycle completion can observe deletion.
 func lockAgentInstance(ctx context.Context, db pgx.Tx, id string) (agentInstanceRow, error) {
 	return queryOne(ctx, db, `
 		SELECT id, user_id, prepared_revision, state, data, operation, context_id,
-		    source_checkpoint_id, history_id FROM agent_instance WHERE id = $1 FOR UPDATE
+		    source_checkpoint_id, history_id, operation_id, executor_id FROM agent_instance WHERE id = $1 FOR UPDATE
 	`, pgx.RowToStructByName[agentInstanceRow], id)
 }
 
@@ -357,17 +292,17 @@ func lockAgentInstance(ctx context.Context, db pgx.Tx, id string) (agentInstance
 func readAgentInstanceRequest(ctx context.Context, db dbExecutor, userID, requestID string) (agentInstanceRow, error) {
 	return queryOne(ctx, db, `
 		SELECT id, user_id, prepared_revision, state, data, operation, context_id,
-		    source_checkpoint_id, history_id FROM agent_instance
+		    source_checkpoint_id, history_id, operation_id, executor_id FROM agent_instance
 		WHERE user_id = $1 AND request_id = $2
 	`, pgx.RowToStructByName[agentInstanceRow], userID, requestID)
 }
 
 // readAgentInstance reads an instance without checking ownership or locking it. Missing
-// instances return pgx.ErrNoRows; callers authorize access.
+// or deleted instances return pgx.ErrNoRows; callers authorize access.
 func readAgentInstance(ctx context.Context, db dbExecutor, id string) (agentInstanceRow, error) {
 	return queryOne(ctx, db, `
 		SELECT id, user_id, prepared_revision, state, data, operation, context_id,
-		    source_checkpoint_id, history_id FROM agent_instance WHERE id = $1
+		    source_checkpoint_id, history_id, operation_id, executor_id FROM agent_instance WHERE id = $1 AND state <> 'AGENT_INSTANCE_STATE_DELETED'
 	`, pgx.RowToStructByName[agentInstanceRow], id)
 }
 
@@ -380,8 +315,8 @@ func insertAgentInstanceRecords(ctx context.Context, db dbExecutor, instance *ap
 		return agentInstanceRow{}, err
 	}
 	if err := execSQL(ctx, db, `
-		INSERT INTO a2a_context (id, user_id, context_id) VALUES ($1, $2, $3)
-	`, historyID, instance.Creator, instance.ContextId); err != nil {
+		INSERT INTO a2a_context (id, context_id) VALUES ($1, $2)
+	`, historyID, instance.ContextId); err != nil {
 		return agentInstanceRow{}, fmt.Errorf("insert A2A context: %w", err)
 	}
 	return queryOne(ctx, db, `
@@ -390,9 +325,31 @@ func insertAgentInstanceRecords(ctx context.Context, db dbExecutor, instance *ap
 		    'AGENT_INSTANCE_STATE_CREATING', 'AGENT_INSTANCE_OPERATION_CREATE', $8)
 		ON CONFLICT (user_id, request_id) DO NOTHING
 		RETURNING id, user_id, prepared_revision, state, data, operation, context_id,
-		    source_checkpoint_id, history_id
+		    source_checkpoint_id, history_id, operation_id, executor_id
 	`,
 		pgx.RowToStructByName[agentInstanceRow], instance.Id, instance.Creator, requestID, instance.ContextId,
 		historyID, instance.PreparedRevision, sourceCheckpointID, data,
 	)
+}
+
+// tombstoneAgentInstance releases runtime references and revokes shares while
+// retaining owner and request identity. Callers hold the instance lock and have
+// established that no uncertain executor can still act. History remains retained.
+func tombstoneAgentInstance(ctx context.Context, tx pgx.Tx, instance *apiv1alpha1.AgentInstance, operationID *uuid.UUID) error {
+	instance.State = apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_DELETED
+	instance.Operation = apiv1alpha1.AgentInstanceOperation_AGENT_INSTANCE_OPERATION_UNSPECIFIED
+	instance.PreparedRevision, instance.A2AAuthority = "", ""
+	instance.UpdatedAt = timestamppb.Now()
+	data, err := marshalAgentInstance(instance)
+	if err != nil {
+		return err
+	}
+	if err := execSQL(ctx, tx, `
+		UPDATE agent_instance SET state = 'AGENT_INSTANCE_STATE_DELETED',
+		    operation = 'AGENT_INSTANCE_OPERATION_UNSPECIFIED', prepared_revision = NULL,
+		    data = $2, operation_id = $3, executor_id = NULL WHERE id = $1
+	`, instance.Id, data, operationID); err != nil {
+		return err
+	}
+	return execSQL(ctx, tx, `DELETE FROM agent_instance_share WHERE instance_id = $1`, instance.Id)
 }
