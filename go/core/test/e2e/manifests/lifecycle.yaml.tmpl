@@ -1,4 +1,4 @@
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: Harness
 metadata:
   name: kagent
@@ -12,18 +12,18 @@ spec:
       name: kagent-default
     snapshotPolicy:
       location: gs://ate-snapshots/kagent/
-  allowedAgentTemplates:
-    selector:
-      matchLabels:
-        kagent.dev/e2e-runtime: kagent
 ---
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: Harness
 metadata:
   name: codex-e2e
   namespace: kagent
 spec:
   codex: {}
+  # TODO: Remove when Substrate denial handling permits native retries (#2663).
+  env:
+  - name: KAGENT_TEST_CODEX_DISABLE_RETRIES
+    value: "true"
   workload:
     image: ${KAGENT_E2E_CODEX_IMAGE}
   substrate:
@@ -31,12 +31,8 @@ spec:
       name: kagent-default
     snapshotPolicy:
       location: gs://ate-snapshots/kagent/
-  allowedAgentTemplates:
-    selector:
-      matchLabels:
-        kagent.dev/e2e-runtime: codex
 ---
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: Harness
 metadata:
   name: byo-e2e
@@ -51,12 +47,8 @@ spec:
       name: kagent-default
     snapshotPolicy:
       location: gs://ate-snapshots/kagent/
-  allowedAgentTemplates:
-    selector:
-      matchLabels:
-        kagent.dev/e2e-runtime: byo
 ---
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: Harness
 metadata:
   name: byo-adk-e2e
@@ -66,26 +58,23 @@ spec:
   workload:
     image: ${KAGENT_E2E_RUNTIME_IMAGE}
     command: ["/app"]
-  env:
-  - name: PORT
-    value: "80"
   substrate:
     workerPoolRef:
       name: kagent-default
     snapshotPolicy:
       location: gs://ate-snapshots/kagent/
-  allowedAgentTemplates:
-    selector:
-      matchLabels:
-        kagent.dev/e2e-runtime: byo-adk
 ---
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: Harness
 metadata:
   name: claude-e2e
   namespace: kagent
 spec:
   claude: {}
+  # TODO: Remove when Substrate denial handling permits native retries (#2663).
+  env:
+  - name: KAGENT_TEST_CLAUDE_DISABLE_RETRIES
+    value: "true"
   workload:
     image: ${KAGENT_E2E_CLAUDE_IMAGE}
   substrate:
@@ -93,12 +82,8 @@ spec:
       name: kagent-default
     snapshotPolicy:
       location: gs://ate-snapshots/kagent/
-  allowedAgentTemplates:
-    selector:
-      matchLabels:
-        kagent.dev/e2e-runtime: claude
 ---
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: AgentTemplate
 metadata:
   name: smoke
@@ -106,12 +91,12 @@ metadata:
   labels:
     kagent.dev/e2e-runtime: kagent
 spec:
-  description: Minimal AgentInstance lifecycle fixture
+  description: Minimal Session lifecycle fixture
   modelConfig:
     name: default-model-config
   systemPrompt: Reply briefly.
 ---
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: AgentTemplate
 metadata:
   name: byo-smoke
@@ -120,3 +105,27 @@ metadata:
     kagent.dev/e2e-runtime: byo
 spec:
   description: Opaque BYO A2A fixture without managed configuration
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: smoke
+  namespace: kagent
+spec:
+  template:
+    ref:
+      name: smoke
+  harnessRef:
+    name: kagent
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: byo-smoke
+  namespace: kagent
+spec:
+  template:
+    ref:
+      name: byo-smoke
+  harnessRef:
+    name: byo-e2e

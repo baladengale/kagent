@@ -56,9 +56,9 @@ kubectl -n kagent port-forward svc/kagent-controller 8083:8083
 ```
 
 Either way `8083` is where the proxy looks, so neither case needs a `.env` entry. Two
-settings change that when you want them to: `KAGENT_DEV_CONTROLLER_URL=http://127.0.0.1:8080`
+settings change that when you want them to: `KAGENT_UI_DEV_CONTROLLER_URL=http://127.0.0.1:8080`
 sends the proxy through the UI pod's nginx instead, which is the hop a deployed build
-takes; and `API_BASE_URL` calls a backend directly, bypassing the proxy.
+takes; and `KAGENT_UI_API_BASE_URL` calls a backend directly, bypassing the proxy.
 
 Which backend is serving is decided in exactly one place, `src/api/config.ts`.
 Nothing above the data layer knows or cares.
@@ -68,7 +68,7 @@ Nothing above the data layer knows or cares.
 Settings an operator configures per deployment cannot travel in the bundle — the
 bundler inlines `import.meta.env` at build time, which would freeze the chart's
 values as of the image build. They arrive on `window.environmentVariables`
-instead, rendered from the pod's environment by `scripts/init.sh` on every start
+instead, rendered from the pod's environment by the `entrypoint/` program on every start
 and loaded by a script tag ahead of the app, so they are readable synchronously
 by the first module that runs. `src/env.ts` lists them; `.env.example` documents
 setting them locally.
@@ -79,12 +79,12 @@ to have landed.
 
 | Setting | Effect |
 | --- | --- |
-| `API_BASE_URL` | where the browser calls the API (default `/api`) |
-| `ENABLE_MOCK_UI` | `true` serves the whole API from in-browser fixtures |
-| `SSO_REDIRECT_PATH` | where "Sign in with SSO" sends the browser |
-| `STREAM_TIMEOUT_MS` | chat stream inactivity timeout |
+| `KAGENT_UI_API_BASE_URL` | where the browser calls the API (default `/api`) |
+| `KAGENT_UI_ENABLE_MOCK` | `true` serves the whole API from in-browser fixtures |
+| `KAGENT_UI_SSO_REDIRECT_PATH` | where "Sign in with SSO" sends the browser |
+| `KAGENT_UI_STREAM_TIMEOUT_MS` | chat stream inactivity timeout |
 
-`ENABLE_MOCK_UI` is a development setting. The release image deliberately ships no
+`KAGENT_UI_ENABLE_MOCK` is a development setting. The release image deliberately ships no
 mock backend, so a built bundle logs a warning and uses the real API rather than
 entering a mode it cannot serve.
 

@@ -65,17 +65,8 @@ type MCPToolBinding struct {
 	RequireApproval bool `json:"requireApproval,omitempty"`
 }
 
-// AgentToolIsolation controls whether a referenced template shares its parent's runtime boundary.
-// +kubebuilder:validation:Enum=Shared;Dedicated
-type AgentToolIsolation string
-
-const (
-	AgentToolIsolationShared    AgentToolIsolation = "Shared"
-	AgentToolIsolationDedicated AgentToolIsolation = "Dedicated"
-)
-
-// AgentToolBinding exposes another same-namespace AgentTemplate as a logical tool.
-type AgentToolBinding struct {
+// SubAgentToolBinding exposes a same-namespace AgentTemplate as a logical tool.
+type SubAgentToolBinding struct {
 	// +kubebuilder:validation:MinLength=1
 	// +required
 	Name string `json:"name"`
@@ -83,21 +74,22 @@ type AgentToolBinding struct {
 	// +kubebuilder:validation:MinLength=1
 	// +required
 	Description string `json:"description"`
-	// +kubebuilder:validation:XValidation:rule="has(self.name) && self.name != ''",message="name must not be empty"
+	// TemplateRef selects a Shared subagent compiled into the parent's runtime using its Harness.
+	// +kubebuilder:validation:XValidation:rule="has(self.name) && self.name != ''",message="templateRef.name must not be empty"
 	// +required
-	TemplateRef corev1.LocalObjectReference `json:"templateRef"`
-	// +kubebuilder:default=Shared
-	// +optional
-	Isolation AgentToolIsolation `json:"isolation,omitempty"`
+	TemplateRef *corev1.LocalObjectReference `json:"templateRef"`
+
+	// Deferred until Dedicated subagents can create and invoke their own Session.
+	// AgentRef *corev1.LocalObjectReference `json:"agentRef,omitempty"`
 }
 
-// ToolBinding selects exactly one MCP or AgentTemplate-backed tool source.
-// +kubebuilder:validation:XValidation:rule="has(self.mcp) != has(self.agent)",message="exactly one of mcp or agent must be specified"
+// ToolBinding selects exactly one MCP or subagent tool source.
+// +kubebuilder:validation:ExactlyOneOf=mcp;subAgent
 type ToolBinding struct {
 	// +optional
 	MCP *MCPToolBinding `json:"mcp,omitempty"`
 	// +optional
-	Agent *AgentToolBinding `json:"agent,omitempty"`
+	SubAgent *SubAgentToolBinding `json:"subAgent,omitempty"`
 }
 
 // AgentTemplateSkill identifies one standalone skill and its immutable source.
@@ -147,7 +139,7 @@ type BucketArtifact struct {
 }
 
 // ArtifactSource selects exactly one immutable artifact.
-// +kubebuilder:validation:XValidation:rule="(has(self.oci) ? 1 : 0) + (has(self.git) ? 1 : 0) + (has(self.bucket) ? 1 : 0) == 1",message="exactly one of oci, git or bucket must be specified"
+// +kubebuilder:validation:ExactlyOneOf=oci;git;bucket
 // +kubebuilder:validation:XValidation:rule="!has(self.path) || (!self.path.startsWith('/') && !self.path.split('/').exists(p, p == '..'))",message="path must be relative and must not contain '..' segments"
 type ArtifactSource struct {
 	// OCI is a digest-pinned image reference.
@@ -177,8 +169,9 @@ type PluginBundle struct {
 }
 
 // AgentTemplateSpec defines portable agent behavior.
-// +kubebuilder:validation:XValidation:rule="!(has(self.systemPrompt) && has(self.systemPromptFrom))",message="systemPrompt and systemPromptFrom are mutually exclusive"
-// +kubebuilder:validation:XValidation:rule="!(has(self.outputSchema) && has(self.outputSchemaFrom))",message="outputSchema and outputSchemaFrom are mutually exclusive"
+// +kubebuilder:validation:AtMostOneOf=systemPrompt;systemPromptFrom
+// +kubebuilder:validation:AtMostOneOf=outputSchema;outputSchemaFrom
+// +kubebuilder:validation:XValidation:rule="!has(self.outputSchemaStrict) || !self.outputSchemaStrict || has(self.outputSchema) || has(self.outputSchemaFrom)",message="outputSchemaStrict requires outputSchema or outputSchemaFrom"
 type AgentTemplateSpec struct {
 	// ModelConfig is required by managed harnesses and optional for BYO harnesses.
 	// +kubebuilder:validation:XValidation:rule="has(self.name) && self.name != ''",message="name must not be empty"
@@ -201,6 +194,11 @@ type AgentTemplateSpec struct {
 	// same-namespace ConfigMap key.
 	// +optional
 	OutputSchemaFrom *ConfigMapKeyReference `json:"outputSchemaFrom,omitempty"`
+	// OutputSchemaStrict tells OpenAI, Azure OpenAI, and Foundry (openai format)
+	// to limit generation to the output schema. kagent then checks the schema
+	// against OpenAI's strict mode rules on every provider.
+	// +optional
+	OutputSchemaStrict bool `json:"outputSchemaStrict,omitempty"`
 	// +optional
 	PromptTemplate *AgentTemplatePromptTemplateSpec `json:"promptTemplate,omitempty"`
 	// +kubebuilder:validation:MaxItems=50
@@ -216,54 +214,9 @@ type AgentTemplateSpec struct {
 	Plugins []PluginBundle `json:"plugins,omitempty"`
 }
 
-const (
-	AgentTemplateConditionAccepted     = "Accepted"
-	AgentTemplateConditionResolvedRefs = "ResolvedRefs"
-	AgentTemplateConditionCompatible   = "Compatible"
-	AgentTemplateConditionReady        = "Ready"
-)
-
-// AgentTemplateHarnessStatus reports runtime revision state for one admitting Harness.
-type AgentTemplateHarnessStatus struct {
-	// Harness names a same-namespace Harness whose admission selector matches
-	// this AgentTemplate.
-	// +kubebuilder:validation:MinLength=1
-	// +required
-	Harness string `json:"harness"`
-	// +kubebuilder:validation:MinLength=1
-	// +required
-	DesiredRevision string `json:"desiredRevision"`
-	// +kubebuilder:validation:MinLength=1
-	// +optional
-	LatestSuccessfulRevision string `json:"latestSuccessfulRevision,omitempty"`
-	// Warnings reports non-blocking compatibility decisions made while compiling
-	// this AgentTemplate for the Harness.
-	// +kubebuilder:validation:MaxItems=100
-	// +listType=set
-	// +optional
-	Warnings []string `json:"warnings,omitempty"`
-	// +kubebuilder:validation:MaxItems=4
-	// +listType=map
-	// +listMapKey=type
-	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
-}
-
-// AgentTemplateStatus is the controller-observed state for each admitting Harness.
-type AgentTemplateStatus struct {
-	// +optional
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-	// Harnesses has at most one entry for each admitting Harness.
-	// +listType=map
-	// +listMapKey=harness
-	// +optional
-	Harnesses []AgentTemplateHarnessStatus `json:"harnesses,omitempty"`
-}
-
 // +genclient
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:path=agenttemplates,singular=agenttemplate,categories=kagent
-// +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // AgentTemplate defines portable agent behavior.
@@ -274,8 +227,6 @@ type AgentTemplate struct {
 
 	// +required
 	Spec AgentTemplateSpec `json:"spec"`
-	// +optional
-	Status AgentTemplateStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

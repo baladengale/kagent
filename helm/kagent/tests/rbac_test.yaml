@@ -100,6 +100,17 @@ tests:
             resources: ["*"]
             verbs: ["get", "list", "watch"]
 
+  - it: should authorize sandbox template catalog access
+    asserts:
+      - contains:
+          path: rules[0].resources
+          content: sandboxtemplates
+        template: rbac/getter-role.yaml
+      - contains:
+          path: rules[0].resources
+          content: sandboxtemplates
+        template: rbac/writer-role.yaml
+
   - it: writer role should have write permissions
     template: rbac/writer-role.yaml
     asserts:
@@ -120,6 +131,50 @@ tests:
       - equal:
           path: metadata.namespace
           value: custom-namespace
+
+  - it: should grant agent access in the new group
+    templates:
+      - rbac/getter-role.yaml
+      - rbac/writer-role.yaml
+    asserts:
+      - equal:
+          path: rules[0].apiGroups
+          value: [api.kagent.dev]
+      - equal:
+          path: rules[0].resources
+          value: [harnesses, agents, egresspolicies, sandboxtemplates, agenttemplates, modelconfigs, modelproviderconfigs, remotemcpservers]
+        template: rbac/getter-role.yaml
+      - equal:
+          path: rules[0].verbs
+          value: [get, list, watch]
+        template: rbac/getter-role.yaml
+      - equal:
+          path: rules[0].resources
+          value: [harnesses, agents, sandboxtemplates, agenttemplates, modelconfigs, modelproviderconfigs, remotemcpservers]
+        template: rbac/writer-role.yaml
+
+  - it: should grant namespaced agent access in the new group
+    set:
+      rbac.namespaces: [NAMESPACE]
+    templates:
+      - rbac/getter-role.yaml
+      - rbac/writer-role.yaml
+    asserts:
+      - equal:
+          path: rules[0].apiGroups
+          value: [api.kagent.dev]
+      - equal:
+          path: rules[0].resources
+          value: [harnesses, agents, egresspolicies, sandboxtemplates, agenttemplates, modelconfigs, modelproviderconfigs, remotemcpservers]
+        template: rbac/getter-role.yaml
+      - equal:
+          path: rules[0].verbs
+          value: [get, list, watch]
+        template: rbac/getter-role.yaml
+      - equal:
+          path: rules[0].resources
+          value: [harnesses, agents, sandboxtemplates, agenttemplates, modelconfigs, modelproviderconfigs, remotemcpservers]
+        template: rbac/writer-role.yaml
 
   - it: should have correct labels on all resources
     templates:

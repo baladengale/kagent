@@ -7,9 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	commonexec "github.com/kagent-dev/kagent/go/core/cli/internal/common/exec"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/connection"
-	"github.com/spf13/cobra"
 )
 
 func runBugReport(namespace string, verbose bool) {
@@ -25,7 +26,7 @@ func runBugReport(namespace string, verbose bool) {
 	kubectl := commonexec.NewKubectlExecutor(verbose, namespace)
 
 	// Get kagent resource YAMLs.
-	resources := []string{"agenttemplate", "harness", "modelconfig", "toolserver", "mcpserver", "remotemcpserver"}
+	resources := []string{"agent", "agenttemplate", "harness", "modelconfig", "toolserver", "mcpserver", "remotemcpserver"}
 	for _, resource := range resources {
 		output, err := kubectl.RunWithOutput("get", resource, "-n", namespace, "-o", "yaml")
 		if err != nil {

@@ -219,11 +219,13 @@ when it holds one page of them, and only the proto says which.
 | `ListSubstrateActors` | `ListSubstrateActorsRequest { atespace, page }` | a page | `string filter` and a sort field enum — **and ate-api has to grow them first** |
 | `ListSubstrateWorkers` | `ListSubstrateWorkersRequest { namespace, page }` | a page | the same two, on the same condition |
 
-**Substrate actor and worker lists use upstream pagination.** Each list request makes
-one ate-api call and preserves its order and continuation token. Actors use upstream
-atespace filtering. Worker namespace filtering applies only to the returned page, so an
-empty worker page may still have a next token. The UI labels counts as "on this page"
-and offers no actor/worker text search or column sorting.
+**Substrate actor and worker lists use upstream pagination.** A controller that watches
+every namespace makes one ate-api call per list request and passes its order and
+continuation token through. Worker namespace filtering then applies only to the returned
+page, so an empty worker page may still have a next token. A controller that watches some
+namespaces reads actors with one scoped ate-api list per watched atespace and returns its
+own token. It reads every ate-api worker page and returns a worker-name cursor. The UI
+labels counts as "on this page" and offers no actor/worker text search or column sorting.
 
 Two capabilities remain deferred until Substrate supports them:
 
@@ -313,41 +315,6 @@ file as the record.
 thousands of conversations — the search and the sort must go server-side in the same
 change. The fields to add are the four in the table above, and there is no longer an RPC
 in this repository carrying them to copy from.
-
-## An agent's page is derived, because a pair is not an object
-
-`/agents/:namespace/:agentTemplate/on/:harness` reads a template and filters
-conversations; there is no `GetAgentPair` because there is no pair *service*. A pair is
-derived — the controller materialises it from admission and retires it when the labels
-stop matching — so nothing creates one and nothing could name one.
-
-Two consequences are visible on screen and are deliberate. An agent cannot be renamed,
-so two agents cut from one template share a name and are told apart by the harness
-column. And an agent's page cannot show a revision history, a creation time, or who made
-it: `agent_template_harness_pair` holds all three and no RPC exposes the table. Adding
-one is the change that would unblock both, and it is a larger decision than this
-surface.
-
-## A new template labelled for the only harness
-
-**What is not covered:** that a new agent template arrives already labelled for the
-harness that will run it, when the cluster has exactly one.
-
-**Why:** the fixtures carry more than one harness on purpose — one of them exists
-specifically so a template can be admitted by *two*, which is what makes an agent list
-show two rows for one template. A single-harness cluster is therefore not a state these
-fixtures can be in, and the default correctly does nothing against them.
-
-The opposite half *is* covered: with several harnesses nothing is chosen for the reader,
-and a template no harness admits says so ("creating one, and being told when nothing
-will run it").
-
-**How it was checked instead:** against the live cluster, which has one harness
-(`kagent`) — the same shape the default exists for.
-
-**What would close it:** a fixture scenario with a single harness. Worth doing when
-something else needs one; a scenario knob added for one assertion is a second fixture
-backend to keep honest.
 
 ## A broken create takes that resource's failure states with it
 

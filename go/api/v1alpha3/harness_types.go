@@ -40,7 +40,7 @@ type KagentHarness struct {
 // (tokenThreshold, eventRetentionSize) bounds the prompt by summarizing
 // everything but the most recent events once the prompt grows past a token
 // count. At least one strategy must be configured.
-// +kubebuilder:validation:XValidation:rule="has(self.compactionInterval) || has(self.tokenThreshold)",message="compactionInterval or tokenThreshold must be specified"
+// +kubebuilder:validation:AtLeastOneOf=compactionInterval;tokenThreshold
 // +kubebuilder:validation:XValidation:rule="has(self.tokenThreshold) == has(self.eventRetentionSize)",message="tokenThreshold and eventRetentionSize must be specified together"
 // +kubebuilder:validation:XValidation:rule="!has(self.overlapSize) || has(self.compactionInterval)",message="overlapSize requires compactionInterval"
 type KagentHarnessCompaction struct {
@@ -112,10 +112,11 @@ type BYOHarness struct{}
 
 // HarnessWorkload identifies the immutable runtime image used by a Harness.
 type HarnessWorkload struct {
-	// Image is an OCI image reference pinned by sha256 digest.
+	// Image overrides the release's built-in runtime image. BYO requires an image.
+	// When set, it must be an OCI image reference pinned by sha256 digest.
 	// +kubebuilder:validation:Pattern=`^[^[:space:]@]+@sha256:[a-f0-9]{64}$`
-	// +required
-	Image string `json:"image"`
+	// +optional
+	Image *string `json:"image,omitempty"`
 
 	// Command overrides the image entrypoint when set.
 	// +kubebuilder:validation:MaxItems=32
@@ -128,57 +129,11 @@ type HarnessWorkload struct {
 	Args []string `json:"args,omitempty"`
 }
 
-// HarnessEnvVar configures one runtime environment variable.
-//
-// +kubebuilder:validation:XValidation:rule="has(self.value) != has(self.credentialRef)",message="exactly one of value or credentialRef must be specified"
-// +kubebuilder:validation:XValidation:rule="!has(self.credentialRef) || self.credentialRef.name.size() > 0",message="credentialRef name must not be empty"
-type HarnessEnvVar struct {
-	// +kubebuilder:validation:MinLength=1
-	// +required
-	Name string `json:"name"`
-
-	// Value is a literal value, including an empty string.
-	// +optional
-	Value *string `json:"value,omitempty"`
-
-	// CredentialRef references a key in a same-namespace Secret.
-	// +optional
-	CredentialRef *corev1.SecretKeySelector `json:"credentialRef,omitempty"`
-}
-
-// HarnessSnapshotPolicy configures storage for Substrate snapshots.
-type HarnessSnapshotPolicy struct {
-	// Location is the snapshot storage location used by Substrate.
-	// +kubebuilder:validation:Pattern=`^[^[:space:]]+$`
-	// +required
-	Location string `json:"location"`
-}
-
-// HarnessSubstratePolicy contains the Substrate policy shared by all runtime variants.
-//
-// +kubebuilder:validation:XValidation:rule="self.workerPoolRef.name.size() > 0",message="workerPoolRef name must not be empty"
-type HarnessSubstratePolicy struct {
-	// WorkerPoolRef references a WorkerPool in the Harness namespace.
-	// +required
-	WorkerPoolRef corev1.LocalObjectReference `json:"workerPoolRef"`
-
-	// SnapshotPolicy configures runtime snapshot storage.
-	// +required
-	SnapshotPolicy HarnessSnapshotPolicy `json:"snapshotPolicy"`
-}
-
-// HarnessAgentTemplateAdmission selects AgentTemplates that this Harness admits.
-// An omitted admission accepts no AgentTemplates.
-type HarnessAgentTemplateAdmission struct {
-	// Selector selects admitted AgentTemplates in the Harness namespace.
-	// +required
-	Selector metav1.LabelSelector `json:"selector"`
-}
-
 // HarnessSpec defines a reusable runtime and its infrastructure policy.
 //
-// +kubebuilder:validation:XValidation:rule="(has(self.kagent) ? 1 : 0) + (has(self.codex) ? 1 : 0) + (has(self.claude) ? 1 : 0) + (has(self.byo) ? 1 : 0) == 1",message="exactly one of kagent, codex, claude, or byo must be specified"
-// +kubebuilder:validation:XValidation:rule="!has(self.byo) || size(self.workload.command) > 0",message="BYO harnesses must specify workload.command"
+// +kubebuilder:validation:ExactlyOneOf=kagent;codex;claude;byo
+// +kubebuilder:validation:XValidation:rule="!has(self.byo) || (has(self.workload) && has(self.workload.command) && size(self.workload.command) > 0)",message="BYO harnesses must specify workload.command"
+// +kubebuilder:validation:XValidation:rule="!has(self.byo) || (has(self.workload) && has(self.workload.image))",message="BYO harnesses must specify workload.image"
 type HarnessSpec struct {
 	// +optional
 	Kagent *KagentHarness `json:"kagent,omitempty"`
@@ -192,22 +147,18 @@ type HarnessSpec struct {
 	// +optional
 	BYO *BYOHarness `json:"byo,omitempty"`
 
-	// +required
-	Workload HarnessWorkload `json:"workload"`
+	// Workload overrides the built-in runtime image and its command. BYO requires it.
+	// +optional
+	Workload HarnessWorkload `json:"workload,omitzero"`
 
 	// +optional
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=name
-	Env []HarnessEnvVar `json:"env,omitempty"`
+	Env []RuntimeEnvVar `json:"env,omitempty"`
 
 	// +required
-	Substrate HarnessSubstratePolicy `json:"substrate"`
-
-	// AllowedAgentTemplates selects AgentTemplates this Harness admits.
-	// When omitted, the Harness admits none.
-	// +optional
-	AllowedAgentTemplates *HarnessAgentTemplateAdmission `json:"allowedAgentTemplates,omitempty"`
+	Substrate RuntimeSubstratePolicy `json:"substrate"`
 }
 
 // HarnessCapabilities records behavior proven for a pinned adapter and runtime.

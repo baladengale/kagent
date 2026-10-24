@@ -5,7 +5,7 @@
  * operator configures per deployment cannot travel in the bundle — it would
  * freeze the chart's values as of the image build and silently ignore whatever
  * was actually set. These values arrive instead on `window.environmentVariables`,
- * written by the container on every start (`scripts/init.sh`) and loaded by a
+ * written by the container on every start (`entrypoint/main.go`) and loaded by a
  * plain script tag ahead of the app, so they are readable synchronously by the
  * first module that runs.
  *
@@ -36,17 +36,17 @@ export interface EnvironmentVariables {
  * publish every credential on the developer's machine into the HTML.
  *
  * An extension's own keys are not listed here, and are not listed anywhere: anything
- * named `EXTENSION_*` is passed through by the dev server and by `scripts/init.sh`,
+ * named `KAGENT_UI_EXTENSION_*` is passed through by the dev server and by `entrypoint/main.go`,
  * and read back with `readEnv`, which takes any key. This application does not know
  * what an extension's settings are and does not need to.
  */
-export const CORE_ENV_KEYS = [
-  "API_BASE_URL",
-  "SSO_REDIRECT_PATH",
-  "STREAM_TIMEOUT_MS",
-  "ENABLE_MOCK_UI",
-  "BASE_PATH",
-] as const satisfies readonly (keyof EnvironmentVariables)[];
+export const CORE_ENV_VARS = {
+  API_BASE_URL: "KAGENT_UI_API_BASE_URL",
+  SSO_REDIRECT_PATH: "KAGENT_UI_SSO_REDIRECT_PATH",
+  STREAM_TIMEOUT_MS: "KAGENT_UI_STREAM_TIMEOUT_MS",
+  ENABLE_MOCK_UI: "KAGENT_UI_ENABLE_MOCK",
+  BASE_PATH: "KAGENT_UI_BASE_PATH",
+} as const satisfies Record<keyof EnvironmentVariables, string>;
 
 /**
  * What the app uses when a key is absent — the normal case for `yarn dev` and

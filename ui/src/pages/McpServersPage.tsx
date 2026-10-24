@@ -35,7 +35,7 @@ const FILTER_IDS: readonly string[] = ["ns", "kind"];
 const PAGE_SIZE = 25;
 
 /**
- * The kind, without the API group: `RemoteMCPServer.kagent.dev` → `RemoteMCPServer`.
+ * The kind, without the API group: `RemoteMCPServer.api.kagent.dev` → `RemoteMCPServer`.
  *
  * The group is the same for every row, so showing it would cost width and tell
  * the reader nothing.
@@ -181,27 +181,14 @@ export function McpServersPage() {
         sorter: byText<FilteredServer>((row) => shortKind(row.server.groupKind)),
         sortOrder: sortOrderFor(view, "kind"),
         render: (_, row) => {
-          // Remote servers are dialled out to; managed ones the controller runs
-          // itself. Colouring them apart makes the two populations legible at a
-          // glance without a legend.
-          //
-          // The colours are the theme's own rather than antd's presets. Those are derived
-          // for a light page: on the dark theme `geekblue` and `purple` measured 4.2:1 and
-          // 3.4:1, and small text needs 4.5. These triples are stated per palette for
-          // exactly this reason — see the palette's note on status pills.
+          // The colours are the theme's own rather than antd's presets, which do
+          // not maintain enough contrast on the dark theme.
           const kind = shortKind(row.server.groupKind);
-          const pill =
-            kind === "RemoteMCPServer"
-              ? {
-                  background: theme.color.infoBg,
-                  borderColor: theme.color.infoBorder,
-                  color: theme.color.infoText,
-                }
-              : {
-                  background: theme.color.accentBg,
-                  borderColor: theme.color.accentBorder,
-                  color: theme.color.accentText,
-                };
+          const pill = {
+            background: theme.color.infoBg,
+            borderColor: theme.color.infoBorder,
+            color: theme.color.infoText,
+          };
           return <Tag css={pill}>{kind}</Tag>;
         },
       },

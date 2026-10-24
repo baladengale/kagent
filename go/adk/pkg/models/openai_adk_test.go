@@ -5,14 +5,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
-
-	"log/slog"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
@@ -48,8 +50,11 @@ func TestOpenAIModelGenerateContentSendsStructuredOutputWithTools(t *testing.T) 
 		Logger: slog.New(slog.DiscardHandler),
 	}
 	schema := map[string]any{
-		"type":       "object",
-		"properties": map[string]any{"answer": map[string]any{"type": "integer"}},
+		"type": "object",
+		"properties": map[string]any{
+			"answer": map[string]any{"type": "integer"},
+			"due":    map[string]any{"type": "string", "format": "date-time", "pattern": "^2026-"},
+		},
 	}
 	request := &model.LLMRequest{
 		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "calculate"}}}},
@@ -79,6 +84,10 @@ func TestOpenAIModelGenerateContentSendsStructuredOutputWithTools(t *testing.T) 
 	}
 	if gotSchema, ok := jsonSchema["schema"].(map[string]any); !ok || gotSchema["type"] != "object" {
 		t.Fatalf("response_format.json_schema.schema = %#v", jsonSchema["schema"])
+	}
+	due := jsonSchema["schema"].(map[string]any)["properties"].(map[string]any)["due"]
+	if want := map[string]any{"type": "string", "format": "date-time", "pattern": "^2026-"}; !reflect.DeepEqual(due, want) {
+		t.Fatalf("response_format.json_schema.schema due = %#v, want %#v", due, want)
 	}
 	if tools, ok := body["tools"].([]any); !ok || len(tools) != 1 {
 		t.Fatalf("tools = %#v, want one tool", body["tools"])
@@ -289,6 +298,19 @@ func TestGenaiContentsToOpenAIMessages(t *testing.T) {
 			t.Errorf("len(messages) = %d, want 1", len(msgs))
 		}
 	})
+
+	t.Run("nil args (replay regression) encode as empty object", func(t *testing.T) {
+		contents := []*genai.Content{
+			{Role: "model", Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{ID: "call_1", Name: "ping", Args: nil}}}},
+		}
+		msgs, _ := genaiContentsToOpenAIMessages(contents, nil)
+		if len(msgs) == 0 || msgs[0].OfAssistant == nil || len(msgs[0].OfAssistant.ToolCalls) != 1 {
+			t.Fatalf("messages = %#v, want first message to be assistant with 1 tool call", msgs)
+		}
+		if got := msgs[0].OfAssistant.ToolCalls[0].GetFunction().Arguments; got != `{}` {
+			t.Errorf("arguments = %q, want {}", got)
+		}
+	})
 }
 
 func TestApplyOpenAIConfig(t *testing.T) {
@@ -308,7 +330,7 @@ func TestApplyOpenAIConfig(t *testing.T) {
 	})
 
 	t.Run("config with max_tokens", func(t *testing.T) {
-		n := 100
+		n := int64(100)
 		cfg := &OpenAIConfig{MaxTokens: &n}
 		var params openai.ChatCompletionNewParams
 		applyOpenAIConfig(&params, cfg)
@@ -318,7 +340,7 @@ func TestApplyOpenAIConfig(t *testing.T) {
 	})
 
 	t.Run("config with max_completion_tokens", func(t *testing.T) {
-		n := 100
+		n := int64(100)
 		cfg := &OpenAIConfig{MaxCompletionTokens: &n}
 		var params openai.ChatCompletionNewParams
 		applyOpenAIConfig(&params, cfg)
@@ -328,8 +350,8 @@ func TestApplyOpenAIConfig(t *testing.T) {
 	})
 
 	t.Run("both set prefers max_completion_tokens", func(t *testing.T) {
-		mt := 100
-		mct := 200
+		mt := int64(100)
+		mct := int64(200)
 		cfg := &OpenAIConfig{MaxTokens: &mt, MaxCompletionTokens: &mct}
 		var params openai.ChatCompletionNewParams
 		applyOpenAIConfig(&params, cfg)
@@ -509,5 +531,15 @@ func TestExtractThoughtSignatureFromStreamingToolCallChunk(t *testing.T) {
 	thoughtSignature := extractThoughtSignatureFromExtraFields(toolCall.JSON.ExtraFields)
 	if string(thoughtSignature) != "abc" {
 		t.Fatalf("thoughtSignature = %q, want %q", string(thoughtSignature), "abc")
+	}
+}
+
+func TestApplyOpenAIConfigPreservesInt64(t *testing.T) {
+	for _, seed := range []int64{math.MinInt64, 9007199254740993, math.MaxInt64} {
+		cfg := &OpenAIConfig{Seed: new(seed), MaxCompletionTokens: new(int64(math.MaxInt64))}
+		var params openai.ChatCompletionNewParams
+		applyOpenAIConfig(&params, cfg)
+		require.Equal(t, seed, params.Seed.Value)
+		require.Equal(t, int64(math.MaxInt64), params.MaxCompletionTokens.Value)
 	}
 }

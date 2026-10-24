@@ -8,30 +8,29 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
+	"google.golang.org/protobuf/proto"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
 	schedules "github.com/kagent-dev/kagent/go/api/scheduledrun"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	"github.com/kagent-dev/kagent/go/core/internal/database"
 	"github.com/kagent-dev/kagent/go/core/internal/service/serviceerrors"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
-	"google.golang.org/protobuf/proto"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type serviceStore interface {
-	FindScheduledRunRequest(context.Context, string, string, []byte) (*apiv1alpha1.ScheduledRun, error)
-	CreateScheduledRun(context.Context, *apiv1alpha1.ScheduledRun, string, []byte) (*apiv1alpha1.ScheduledRun, error)
-	GetScheduledRun(context.Context, uuid.UUID, string) (*apiv1alpha1.ScheduledRun, error)
-	ListScheduledRuns(context.Context, database.ScheduledRunQuery) ([]*apiv1alpha1.ScheduledRun, error)
-	UpdateScheduledRun(context.Context, uuid.UUID, string, string, *apiv1alpha1.ScheduledRunConfig) (*apiv1alpha1.ScheduledRun, error)
-	DeleteScheduledRun(context.Context, uuid.UUID, string) (*apiv1alpha1.ScheduledRun, error)
-	TriggerScheduledRun(context.Context, uuid.UUID, string, string) (*apiv1alpha1.ScheduledRunExecution, error)
-	GetScheduledRunExecution(context.Context, uuid.UUID, string) (*apiv1alpha1.ScheduledRunExecution, error)
-	ListScheduledRunExecutions(context.Context, database.ScheduledRunExecutionQuery) ([]*apiv1alpha1.ScheduledRunExecution, error)
+	FindScheduledRunRequest(context.Context, string, string, []byte) (*apiv1.ScheduledRun, error)
+	CreateScheduledRun(context.Context, *apiv1.ScheduledRun, string, []byte) (*apiv1.ScheduledRun, error)
+	GetScheduledRun(context.Context, uuid.UUID, string) (*apiv1.ScheduledRun, error)
+	ListScheduledRuns(context.Context, database.ScheduledRunQuery) ([]*apiv1.ScheduledRun, error)
+	UpdateScheduledRun(context.Context, uuid.UUID, string, string, *apiv1.ScheduledRunConfig) (*apiv1.ScheduledRun, error)
+	DeleteScheduledRun(context.Context, uuid.UUID, string) (*apiv1.ScheduledRun, error)
+	TriggerScheduledRun(context.Context, uuid.UUID, string, string) (*apiv1.ScheduledRunExecution, error)
+	GetScheduledRunExecution(context.Context, uuid.UUID, string) (*apiv1.ScheduledRunExecution, error)
+	ListScheduledRunExecutions(context.Context, database.ScheduledRunExecutionQuery) ([]*apiv1.ScheduledRunExecution, error)
 }
 
 type Service struct {
@@ -41,16 +40,16 @@ type Service struct {
 }
 
 type CreateRequest struct {
-	Harness, AgentTemplate *apiv1alpha1.ResourceReference
-	RequestID              string
-	Config                 *apiv1alpha1.ScheduledRunConfig
+	Agent     *apiv1.ResourceReference
+	RequestID string
+	Config    *apiv1.ScheduledRunConfig
 }
 
 func NewService(store serviceStore, kube client.Reader, authorizer auth.Authorizer) *Service {
 	return &Service{store: store, kube: kube, authorizer: authorizer}
 }
 
-func (s *Service) Create(ctx context.Context, request CreateRequest) (*apiv1alpha1.ScheduledRun, error) {
+func (s *Service) Create(ctx context.Context, request CreateRequest) (*apiv1.ScheduledRun, error) {
 	creator, err := s.authorize(ctx, auth.VerbCreate, "")
 	if err != nil {
 		return nil, err
@@ -60,8 +59,8 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (*apiv1alph
 		return nil, err
 	}
 	// Hash original normalized inputs, not the mutable persisted configuration.
-	data, err := (proto.MarshalOptions{Deterministic: true}).Marshal(&apiv1alpha1.CreateScheduledRunRequest{
-		Harness: request.Harness, AgentTemplate: request.AgentTemplate, Config: config,
+	data, err := (proto.MarshalOptions{Deterministic: true}).Marshal(&apiv1.CreateScheduledRunRequest{
+		Agent: request.Agent, Config: config,
 	})
 	if err != nil {
 		return nil, serviceerrors.NewInvalidArgument("Invalid schedule inputs", err)
@@ -69,15 +68,17 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (*apiv1alph
 	hash := sha256.Sum256(data)
 	existing, err := s.store.FindScheduledRunRequest(ctx, creator, request.RequestID, hash[:])
 	if err == nil {
+		if err := s.authorizeTarget(ctx, existing); err != nil {
+			return nil, err
+		}
 		return existing, nil
 	}
 	if !errors.Is(err, database.ErrNotFound) {
 		return nil, storeError(err)
 	}
-	schedule := &apiv1alpha1.ScheduledRun{
+	schedule := &apiv1.ScheduledRun{
 		Creator: creator, Config: config,
-		Harness:       proto.CloneOf(request.Harness),
-		AgentTemplate: proto.CloneOf(request.AgentTemplate),
+		Agent: proto.CloneOf(request.Agent),
 	}
 	if err := s.authorizeTarget(ctx, schedule); err != nil {
 		return nil, err
@@ -89,7 +90,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (*apiv1alph
 	return result, storeError(err)
 }
 
-func (s *Service) Get(ctx context.Context, id uuid.UUID) (*apiv1alpha1.ScheduledRun, error) {
+func (s *Service) Get(ctx context.Context, id uuid.UUID) (*apiv1.ScheduledRun, error) {
 	creator, err := s.authorize(ctx, auth.VerbGet, id.String())
 	if err != nil {
 		return nil, err
@@ -98,8 +99,8 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (*apiv1alpha1.Scheduled
 	return result, storeError(err)
 }
 
-func (s *Service) List(ctx context.Context, page *apiv1alpha1.PageRequest) ([]*apiv1alpha1.ScheduledRun, string, error) {
-	creator, err := s.authorize(ctx, auth.VerbGet, "")
+func (s *Service) List(ctx context.Context, page *apiv1.PageRequest) ([]*apiv1.ScheduledRun, string, error) {
+	creator, err := s.authorize(ctx, auth.VerbList, "")
 	if err != nil {
 		return nil, "", err
 	}
@@ -118,7 +119,7 @@ func (s *Service) List(ctx context.Context, page *apiv1alpha1.PageRequest) ([]*a
 	return rows, "", nil
 }
 
-func (s *Service) Update(ctx context.Context, id uuid.UUID, etag string, config *apiv1alpha1.ScheduledRunConfig) (*apiv1alpha1.ScheduledRun, error) {
+func (s *Service) Update(ctx context.Context, id uuid.UUID, etag string, config *apiv1.ScheduledRunConfig) (*apiv1.ScheduledRun, error) {
 	creator, err := s.authorize(ctx, auth.VerbUpdate, id.String())
 	if err != nil {
 		return nil, err
@@ -139,7 +140,7 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, etag string, config 
 	return result, storeError(err)
 }
 
-func (s *Service) Delete(ctx context.Context, id uuid.UUID) (*apiv1alpha1.ScheduledRun, error) {
+func (s *Service) Delete(ctx context.Context, id uuid.UUID) (*apiv1.ScheduledRun, error) {
 	creator, err := s.authorize(ctx, auth.VerbDelete, id.String())
 	if err != nil {
 		return nil, err
@@ -148,7 +149,7 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) (*apiv1alpha1.Schedu
 	return result, storeError(err)
 }
 
-func (s *Service) Trigger(ctx context.Context, id uuid.UUID, requestID string) (*apiv1alpha1.ScheduledRunExecution, error) {
+func (s *Service) Trigger(ctx context.Context, id uuid.UUID, requestID string) (*apiv1.ScheduledRunExecution, error) {
 	creator, err := s.authorize(ctx, auth.VerbCreate, id.String()+"/executions")
 	if err != nil {
 		return nil, err
@@ -164,7 +165,7 @@ func (s *Service) Trigger(ctx context.Context, id uuid.UUID, requestID string) (
 	return result, storeError(err)
 }
 
-func (s *Service) GetExecution(ctx context.Context, id uuid.UUID) (*apiv1alpha1.ScheduledRunExecution, error) {
+func (s *Service) GetExecution(ctx context.Context, id uuid.UUID) (*apiv1.ScheduledRunExecution, error) {
 	creator, err := s.authorize(ctx, auth.VerbGet, "executions/"+id.String())
 	if err != nil {
 		return nil, err
@@ -173,8 +174,8 @@ func (s *Service) GetExecution(ctx context.Context, id uuid.UUID) (*apiv1alpha1.
 	return result, storeError(err)
 }
 
-func (s *Service) ListExecutions(ctx context.Context, id uuid.UUID, page *apiv1alpha1.PageRequest) ([]*apiv1alpha1.ScheduledRunExecution, string, error) {
-	creator, err := s.authorize(ctx, auth.VerbGet, id.String()+"/executions")
+func (s *Service) ListExecutions(ctx context.Context, id uuid.UUID, page *apiv1.PageRequest) ([]*apiv1.ScheduledRunExecution, string, error) {
+	creator, err := s.authorize(ctx, auth.VerbList, id.String()+"/executions")
 	if err != nil {
 		return nil, "", err
 	}
@@ -198,9 +199,9 @@ func (s *Service) authorize(ctx context.Context, verb auth.Verb, name string) (s
 	if !ok || session.Principal().User.ID == "" {
 		return "", serviceerrors.NewUnauthenticated("Authentication is required", nil)
 	}
-	// An instance capability never grants schedule access, even for in-process callers.
+	// A session capability never grants schedule access, even for in-process callers.
 	if _, shared := auth.ShareContextFrom(ctx); shared {
-		return "", serviceerrors.NewPermissionDenied("Instance shares do not grant schedule access", nil)
+		return "", serviceerrors.NewPermissionDenied("Session shares do not grant schedule access", nil)
 	}
 	principal := session.Principal()
 	if err := s.authorizer.Check(ctx, principal, verb, auth.Resource{Type: "ScheduledRun", Name: name}); err != nil {
@@ -209,53 +210,32 @@ func (s *Service) authorize(ctx context.Context, verb auth.Verb, name string) (s
 	return principal.User.ID, nil
 }
 
-func (s *Service) authorizeTarget(ctx context.Context, schedule *apiv1alpha1.ScheduledRun) error {
+func (s *Service) authorizeTarget(ctx context.Context, schedule *apiv1.ScheduledRun) error {
 	session, _ := auth.AuthSessionFrom(ctx) // Each public operation authorizes before target access.
 	principal := session.Principal()
-	for _, resource := range []struct {
-		kind, name string
-		verb       auth.Verb
-	}{
-		{"Harness", schedule.Harness.Namespace + "/" + schedule.Harness.Name, auth.VerbGet},
-		{"AgentTemplate", schedule.AgentTemplate.Namespace + "/" + schedule.AgentTemplate.Name, auth.VerbGet},
-		{"AgentInstance", "", auth.VerbCreate},
-	} {
-		if err := s.authorizer.Check(ctx, principal, resource.verb, auth.Resource{Type: resource.kind, Name: resource.name}); err != nil {
-			return serviceerrors.NewPermissionDenied("Not authorized to run target pair", err)
-		}
+	if err := s.authorizer.Check(ctx, principal, auth.VerbGet, auth.Resource{
+		Type: "Agent", Namespace: schedule.Agent.Namespace, Name: schedule.Agent.Name,
+	}); err != nil {
+		return serviceerrors.NewPermissionDenied("Not authorized to run Agent", err)
+	}
+	if err := s.authorizer.Check(ctx, principal, auth.VerbCreate, auth.Resource{Type: "Session", Namespace: schedule.Agent.Namespace}); err != nil {
+		return serviceerrors.NewPermissionDenied("Not authorized to create Session", err)
 	}
 	return nil
 }
 
-func (s *Service) validateTarget(ctx context.Context, schedule *apiv1alpha1.ScheduledRun) error {
-	harness := &v1alpha3.Harness{}
-	template := &v1alpha3.AgentTemplate{}
-	for _, target := range []client.Object{harness, template} {
-		name := schedule.Harness.Name
-		if target == template {
-			name = schedule.AgentTemplate.Name
+func (s *Service) validateTarget(ctx context.Context, schedule *apiv1.ScheduledRun) error {
+	agent := &v1alpha3.Agent{}
+	if err := s.kube.Get(ctx, types.NamespacedName{Namespace: schedule.Agent.Namespace, Name: schedule.Agent.Name}, agent); err != nil {
+		if apierrors.IsNotFound(err) {
+			return serviceerrors.NewFailedPrecondition("Agent does not exist", err)
 		}
-		if err := s.kube.Get(ctx, types.NamespacedName{Namespace: schedule.Harness.Namespace, Name: name}, target); err != nil {
-			if apierrors.IsNotFound(err) {
-				return serviceerrors.NewFailedPrecondition("Target pair does not exist", err)
-			}
-			return serviceerrors.NewInternal("Failed to resolve target pair", err)
-		}
-	}
-	if harness.Spec.AllowedAgentTemplates == nil {
-		return serviceerrors.NewFailedPrecondition("Harness does not admit AgentTemplate", nil)
-	}
-	selector, err := metav1.LabelSelectorAsSelector(&harness.Spec.AllowedAgentTemplates.Selector)
-	if err != nil {
-		return serviceerrors.NewFailedPrecondition("Invalid Harness admission selector", err)
-	}
-	if !selector.Matches(labels.Set(template.Labels)) {
-		return serviceerrors.NewFailedPrecondition("Harness does not admit AgentTemplate", nil)
+		return serviceerrors.NewInternal("Failed to resolve Agent", err)
 	}
 	return nil
 }
 
-func normalizeConfig(config *apiv1alpha1.ScheduledRunConfig) (*apiv1alpha1.ScheduledRunConfig, error) {
+func normalizeConfig(config *apiv1.ScheduledRunConfig) (*apiv1.ScheduledRunConfig, error) {
 	config = schedules.Normalize(config)
 	if _, err := schedules.Next(config, time.Now()); err != nil {
 		return nil, serviceerrors.NewInvalidArgument("Invalid schedule", err)
@@ -263,7 +243,7 @@ func normalizeConfig(config *apiv1alpha1.ScheduledRunConfig) (*apiv1alpha1.Sched
 	return config, nil
 }
 
-func listQuery(page *apiv1alpha1.PageRequest, creator string) (database.ScheduledRunQuery, error) {
+func listQuery(page *apiv1.PageRequest, creator string) (database.ScheduledRunQuery, error) {
 	limit := int(page.GetLimit())
 	if limit == 0 {
 		limit = 50

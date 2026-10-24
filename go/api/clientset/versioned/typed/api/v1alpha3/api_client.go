@@ -12,10 +12,13 @@ import (
 
 type ApiV1alpha3Interface interface {
 	RESTClient() rest.Interface
+	AgentsGetter
 	AgentTemplatesGetter
+	EgressPoliciesGetter
 	HarnessesGetter
 	ModelConfigsGetter
 	RemoteMCPServersGetter
+	SandboxTemplatesGetter
 }
 
 // ApiV1alpha3Client is used to interact with features provided by the api group.
@@ -23,8 +26,16 @@ type ApiV1alpha3Client struct {
 	restClient rest.Interface
 }
 
+func (c *ApiV1alpha3Client) Agents(namespace string) AgentInterface {
+	return newAgents(c, namespace)
+}
+
 func (c *ApiV1alpha3Client) AgentTemplates(namespace string) AgentTemplateInterface {
 	return newAgentTemplates(c, namespace)
+}
+
+func (c *ApiV1alpha3Client) EgressPolicies(namespace string) EgressPolicyInterface {
+	return newEgressPolicies(c, namespace)
 }
 
 func (c *ApiV1alpha3Client) Harnesses(namespace string) HarnessInterface {
@@ -37,6 +48,10 @@ func (c *ApiV1alpha3Client) ModelConfigs(namespace string) ModelConfigInterface 
 
 func (c *ApiV1alpha3Client) RemoteMCPServers(namespace string) RemoteMCPServerInterface {
 	return newRemoteMCPServers(c, namespace)
+}
+
+func (c *ApiV1alpha3Client) SandboxTemplates(namespace string) SandboxTemplateInterface {
+	return newSandboxTemplates(c, namespace)
 }
 
 // NewForConfig creates a new ApiV1alpha3Client for the given config.

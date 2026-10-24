@@ -7,7 +7,9 @@ from a2a.server.agent_execution.context import RequestContext
 from a2a.server.context import ServerCallContext
 from a2a.types import Artifact, Message, Part, Role, SendMessageRequest, TaskArtifactUpdateEvent
 from google.adk.a2a.converters.request_converter import AgentRunRequest
+from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.runners import InMemoryRunner
 from google.protobuf.json_format import ParseDict
 from google.protobuf.struct_pb2 import Value
 from kagent.core.a2a import (
@@ -15,10 +17,12 @@ from kagent.core.a2a import (
     A2A_PART_TYPE_METADATA_KEY,
     A2A_USAGE_METADATA_KEY,
 )
+from kagent.core.a2a._requests import KAgentUser
 
 import kagent.adk._agent_executor as executor_module
 from kagent.adk._agent_executor import A2aAgentExecutor, A2aAgentExecutorConfig
 from kagent.adk._bearer_token import bearer_token
+from kagent.adk._request_identity import request_user_id
 
 
 @pytest.fixture(autouse=True)
@@ -114,10 +118,13 @@ def test_adk_event_metadata_is_projected_at_adapter_boundary():
 
 
 @pytest.mark.asyncio
-async def test_execute_delegates_to_adk_2_executor_and_closes_request_runner(monkeypatch):
+@pytest.mark.parametrize("caller", ["", "alice"])
+async def test_execute_delegates_to_adk_2_executor_and_closes_request_runner(monkeypatch, caller):
     context = _request_context()
+    if caller:
+        context.call_context.user = KAgentUser(caller)
     event_queue = object()
-    runner = object()
+    runner = InMemoryRunner(agent=BaseAgent(name="agent"), app_name="app")
     run_request = AgentRunRequest(
         user_id="user-1",
         session_id="context-1",
@@ -137,15 +144,21 @@ async def test_execute_delegates_to_adk_2_executor_and_closes_request_runner(mon
 
         async def execute(self, request_context, queue):
             calls.update(context=request_context, event_queue=queue)
+            assert request_user_id.get() == caller
 
     monkeypatch.setattr(executor_module, "UpstreamA2aAgentExecutor", FakeUpstreamExecutor)
 
-    await executor.execute(context, event_queue)
+    token = request_user_id.set("outer-caller")
+    try:
+        await executor.execute(context, event_queue)
+        assert request_user_id.get() == "outer-caller"
+    finally:
+        request_user_id.reset(token)
 
     assert calls["runner"] is runner
     assert calls["force_new_version"] is True
     assert calls["context"] is context
-    assert calls["event_queue"] is event_queue
+    assert calls["event_queue"]._queue is event_queue
     assert calls["config"].request_converter == executor._convert_request
     assert calls["config"].a2a_part_converter == executor_module._convert_public_a2a_part_to_genai_part
     executor._prepare_session.assert_awaited_once_with(context, run_request, runner)

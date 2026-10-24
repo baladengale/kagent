@@ -30,7 +30,8 @@ test("substrate: the inventory renders, and partial runtime data says so", async
     // and suspending, which is exactly the case a bare count would hide.
     await expect(page.getByTestId("substrate-stat-actors-value")).toHaveText("2/8");
     await expect(page.getByTestId("substrate-stat-workers-value")).toHaveText("1/2");
-    await expect(page.getByTestId("substrate-stat-scope-value")).toHaveText("all");
+    await expect(page.getByTestId("substrate-stat-scope")).toContainText("Requested filters");
+    await expect(page.getByTestId("substrate-stat-scope-value")).toHaveText("none");
   });
 
   await test.step("2b. the bar is the shape of the cluster, not just its running tally", async () => {
@@ -64,8 +65,7 @@ test("substrate: the inventory renders, and partial runtime data says so", async
       "Resuming Actors: 1",
       "Running Actors: 2",
       "Suspending Actors: 1",
-      "Paused Actors: 1",
-      "Suspended Actors: 1",
+      "Suspended Actors: 2",
     ]) {
       await expect(tip).toContainText(line);
     }
@@ -75,11 +75,15 @@ test("substrate: the inventory renders, and partial runtime data says so", async
     const legend = page.getByTestId("substrate-actor-status-counts-legend");
     await expect(legend).toContainText("Crashed: 1");
     await expect(legend).toContainText("Running: 2");
-    await expect(legend).toContainText("Suspended: 1");
+    // The summary counts both paused and durably suspended actors as SUSPENDED.
+    await expect(legend).toContainText("Suspended: 2");
+    await expect(legend).not.toContainText("Paused:");
 
     // Every state the controller can report, so a reader learns the vocabulary from the
     // page rather than from waiting for something to go wrong.
-    await expect(legend).toContainText("Pausing: 0");
+    await expect(legend).toContainText("Reverting: 0");
+    await expect(legend).not.toContainText("Pausing:");
+    await expect(legend).not.toContainText("Snapshotting:");
     await expect(legend).toContainText("Unknown: 0");
     // `ACTOR_STATE_CRASHED` and a vocabulary entry of `Crashed` are the same status, and
     // keying the legend on the wire value listed it twice — once at zero.
@@ -89,14 +93,14 @@ test("substrate: the inventory renders, and partial runtime data says so", async
     // reader nor a keyboard has one. Colour is never carrying this alone.
     await expect(bar).toHaveAttribute(
       "aria-label",
-      "Actor status. Crashed Actors: 1, Deleting Actors: 1, Resuming Actors: 1, Running Actors: 2, Suspending Actors: 1, Paused Actors: 1, Suspended Actors: 1",
+      "Actor status. Crashed Actors: 1, Deleting Actors: 1, Resuming Actors: 1, Running Actors: 2, Suspending Actors: 1, Suspended Actors: 2",
     );
   });
 
   await test.step("3. the worker pools the sandboxes run on", async () => {
     const pools = page.getByTestId("substrate-pools-table");
     await expect(pools).toBeVisible();
-    await expect(pools).toContainText("kagent/default-pool");
+    await expect(pools).toContainText("kagent/kagent-default");
     await expect(pools).toContainText("platform/gpu-pool");
     // The image tag, which is what an operator checks against a release.
     await expect(pools).toContainText("ateom:1.4.0");
@@ -111,9 +115,8 @@ test("substrate: the inventory renders, and partial runtime data says so", async
     // The golden Tag identifies the snapshot used to create actors from this template.
     await expect(templates).toContainText("golden: ate-golden/snap-2026-07-28");
 
-    // The rest of what decides where and how a template runs.
-    await expect(templates).toContainText("gvisor");
-    await expect(templates).toContainText("pool=default-pool");
+    // The worker selector determines placement; the pool owns runtime selection.
+    await expect(templates).toContainText("pool=kagent-default");
     await expect(templates.getByRole("columnheader", { name: "Harness", exact: true })).toHaveCount(0);
 
     // Both phases, and coloured by what they mean rather than all alike: a Ready template
@@ -128,16 +131,23 @@ test("substrate: the inventory renders, and partial runtime data says so", async
   await test.step("5. the actors placed right now, and the pods holding them", async () => {
     const actors = page.getByTestId("substrate-actors-table");
     await expect(actors).toBeVisible();
+    // The first worker holds two actors, so the page explains sharing.
+    await expect(page.getByTestId("substrate-actors-shared-note")).toContainText(
+      "Multiple actors are running on the same worker.",
+    );
     await expect(actors).toContainText("actor-7f21");
     await expect(actors).toContainText("kagent/coder-template");
     // The pod, with its IP appended — the two facts an operator needs to go and look.
-    await expect(actors).toContainText("kagent/ateom-default-pool-0");
+    await expect(actors).toContainText("kagent/ateom-kagent-default-0");
     await expect(actors).toContainText("10.42.1.19");
 
     // Both wire constants are read to the operator as words — a humaniser that only knew
     // `CRASHED` would leave the other one showing the controller's vocabulary.
     await expect(actors).not.toContainText("ACTOR_STATE_");
     await expect(actors).toContainText("Deleting");
+    // Individual snapshots still distinguish a node-local pause from durable suspension.
+    await expect(actors.getByRole("row").filter({ hasText: "actor-5d17" })).toContainText("Paused");
+    await expect(actors.getByRole("row").filter({ hasText: "actor-c3f5" })).toContainText("Suspended");
     await expect(
       actors.locator("[data-tone]").filter({ hasText: "Crashed" }),
     ).toHaveAttribute("data-tone", "danger");
@@ -146,8 +156,8 @@ test("substrate: the inventory renders, and partial runtime data says so", async
   await test.step("6. the workers, and no claim about which actor is on them", async () => {
     const workers = page.getByTestId("substrate-workers-table");
     await expect(workers).toBeVisible();
-    await expect(workers).toContainText("kagent/ateom-default-pool-0");
-    await expect(workers).toContainText("default-pool");
+    await expect(workers).toContainText("kagent/ateom-kagent-default-0");
+    await expect(workers).toContainText("kagent-default");
     await expect(workers).toContainText("10.42.1.19");
 
     /*
@@ -182,7 +192,7 @@ test("substrate: the scope narrows what is read, and is carried in the URL", asy
     await expect(page.getByTestId("substrate-namespace")).toContainText(
       "All watched namespaces",
     );
-    await expect(page.getByTestId("substrate-pools-table")).toContainText("kagent/default-pool");
+    await expect(page.getByTestId("substrate-pools-table")).toContainText("kagent/kagent-default");
     await expect(page.getByTestId("substrate-pools-table")).toContainText("platform/gpu-pool");
   });
 
@@ -195,10 +205,10 @@ test("substrate: the scope narrows what is read, and is carried in the URL", asy
     await optionNamed(page, "kagent").click();
 
     await expect(page).toHaveURL(/namespace=kagent/);
-    await expect(page.getByTestId("substrate-stat-scope-value")).toHaveText("K8s: kagent; ATE: all");
+    await expect(page.getByTestId("substrate-stat-scope-value")).toHaveText("K8s: kagent; ATE: any");
 
     const pools = page.getByTestId("substrate-pools-table");
-    await expect(pools).toContainText("kagent/default-pool");
+    await expect(pools).toContainText("kagent/kagent-default");
     await expect(pools).not.toContainText("platform/gpu-pool");
 
     const templates = page.getByTestId("substrate-templates-table");
@@ -216,7 +226,7 @@ test("substrate: the scope narrows what is read, and is carried in the URL", asy
     await expect(page.getByTestId("substrate-actors-table")).toContainText("team-a/actor-7f21");
     await expect(page.getByTestId("substrate-actors-table")).toContainText("kagent/coder-template");
     await expect(page.getByTestId("substrate-templates-table")).not.toContainText("coder-template");
-    await expect(page.getByTestId("substrate-pools-table")).toContainText("kagent/default-pool");
+    await expect(page.getByTestId("substrate-pools-table")).toContainText("kagent/kagent-default");
     await expect(page.getByTestId("substrate-stat-workers-value")).toHaveText("1/2");
     await page.reload();
     await expect(page.getByRole("searchbox", { name: "ATE atespace", exact: true })).toHaveValue("team-a");
@@ -232,7 +242,7 @@ test("substrate: the scope narrows what is read, and is carried in the URL", asy
     await expectSettled(page);
 
     await expect(page.getByTestId("substrate-namespace")).toContainText("platform");
-    await expect(page.getByTestId("substrate-stat-scope-value")).toHaveText("K8s: platform; ATE: all");
+    await expect(page.getByTestId("substrate-stat-scope-value")).toHaveText("K8s: platform; ATE: any");
     await expect(page.getByTestId("substrate-pools-table")).toContainText("platform/gpu-pool");
   });
 
@@ -268,6 +278,7 @@ test("substrate: an empty inventory is shown without errors", async ({
   await expect(page.getByTestId("substrate-actors-table")).toContainText(
     "No actors on this page.",
   );
+  await expect(page.getByTestId("substrate-actors-shared-note")).toHaveCount(0);
   await expect(page.getByTestId("substrate-workers-table")).toContainText(
     "No worker assignments in this namespace scope on this page.",
   );

@@ -87,6 +87,33 @@ it activated the extension:
 
 The `hint` field of an activated payload holds that same string.
 
+## Configuring built-in questions
+
+The Go and Python ADK runtimes enable the built-in `ask_user` tool by default.
+To disable it across agents managed by the controller, use these Helm values:
+
+```yaml
+config:
+  runtimeDefaults:
+    builtinTools:
+      disableAskUser: true
+```
+
+In a controller configuration file, the same setting is
+`runtimeDefaults.builtinTools.disableAskUser` (without the Helm `config` prefix).
+The controller passes it to ADK runtimes as
+`runtime.builtin_tools.disable_ask_user`. Omitted or `false` preserves the enabled
+behavior, following the existing `disableBash` convention.
+
+The shared runtime setting also applies to Go Shared subagents. A BYO image that
+uses the ADK configuration contract can honor the same setting. Native Claude
+and Codex harnesses and custom BYO implementations manage their own tools.
+There is no per-template or Harness override.
+
+Disabling this built-in tool does not disable MCP tool approvals or questions
+from remote A2A agents, so it does not guarantee that every task can complete
+without human input.
+
 ## Ownership
 
 | Component | Responsibility |
@@ -101,7 +128,7 @@ The kagent Go harness maps the contract to ADK confirmations. Remote A2A tools i
 the Go and Python ADKs can retain a child continuation when a subagent requests
 input.
 
-The current v2 MCP tool-binding API does not expose per-tool approval policy, so
+The current MCP tool-binding API does not expose per-tool approval policy, so
 users cannot configure generic MCP approval gating through `AgentTemplate` today.
 The extension remains valid for runtimes and tools that actually produce a pause,
 including ask-user and nested A2A continuation.

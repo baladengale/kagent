@@ -9,8 +9,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
-	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/instance"
+
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
+	sessionview "github.com/kagent-dev/kagent/go/core/cli/internal/tui/session"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/theme"
 )
 
@@ -20,22 +21,19 @@ type panelID int
 const (
 	panelChat       panelID = 0
 	panelNamespaces panelID = 1
-	panelHarnesses  panelID = 2
-	panelTemplates  panelID = 3
-	panelInstances  panelID = 4
-	lastListPanel           = panelInstances
+	panelAgents     panelID = 2
+	panelSessions   panelID = 3
+	lastListPanel           = panelSessions
 )
 
 func (p panelID) title() string {
 	switch p {
 	case panelNamespaces:
 		return "Namespaces"
-	case panelHarnesses:
-		return "Harnesses"
-	case panelTemplates:
-		return "AgentTemplates"
-	case panelInstances:
-		return "AgentInstances"
+	case panelAgents:
+		return "Agents"
+	case panelSessions:
+		return "Sessions"
 	default:
 		return "Chat"
 	}
@@ -55,27 +53,48 @@ const panelChromeHeight = 3 // both borders plus the title line
 func panelInnerWidth(total int) int  { return max(total-4, 8) }
 func panelInnerHeight(total int) int { return max(total-panelChromeHeight, 1) }
 
+// borderColor is a panel border's colour, which the chat's input bar shares.
+func borderColor(focused bool) lipgloss.AdaptiveColor {
+	if focused {
+		return theme.ColorPrimary
+	}
+	return theme.ColorBorder
+}
+
+// panelKeyStyle styles a panel's "[n]" focus key, highlighted when focused.
+func panelKeyStyle(focused bool) lipgloss.Style {
+	if focused {
+		return lipgloss.NewStyle().Foreground(theme.ColorPrimary).Bold(true)
+	}
+	return theme.DimStyle()
+}
+
 // panelBox draws a bordered panel titled with its number, highlighted when focused.
 func panelBox(id panelID, content string, width, height int, focused bool) string {
-	border := theme.ColorBorder
-	titleStyle := theme.DimStyle()
-	if focused {
-		border = theme.ColorPrimary
-		titleStyle = lipgloss.NewStyle().Foreground(theme.ColorPrimary).Bold(true)
-	}
-
-	body := lipgloss.JoinVertical(lipgloss.Left,
-		titleStyle.Render(fmt.Sprintf("[%d] %s", id, id.title())),
+	return panelFrame(lipgloss.JoinVertical(lipgloss.Left,
+		panelKeyStyle(focused).Render(fmt.Sprintf("[%d] %s", id, id.title())),
 		lipgloss.NewStyle().
 			Width(panelInnerWidth(width)).
 			Height(panelInnerHeight(height)).
 			Render(trimBlankLines(content)),
-	)
+	), width, focused)
+}
+
+// untitledBox draws a bordered panel whose content carries its own title row, such as an open chat.
+func untitledBox(content string, width, height int, focused bool) string {
+	return panelFrame(lipgloss.NewStyle().
+		Width(panelInnerWidth(width)).
+		Height(max(height-2, 1)).
+		Render(trimBlankLines(content)), width, focused)
+}
+
+// panelFrame puts the rounded border and padding around a panel's body.
+func panelFrame(body string, width int, focused bool) string {
 	return lipgloss.NewStyle().
 		Width(width-2). // lipgloss adds the border outside the styled width
 		Padding(0, 1).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(border).
+		BorderForeground(borderColor(focused)).
 		Render(body)
 }
 
@@ -90,7 +109,7 @@ func newPanelList(delegate list.ItemDelegate) list.Model {
 	return panelList
 }
 
-// nameItem is a harness or template row, with how many AgentInstances it holds.
+// nameItem is a harness or template row, with how many Sessions it holds.
 type nameItem struct {
 	name  string
 	count int
@@ -98,30 +117,30 @@ type nameItem struct {
 
 func (i nameItem) FilterValue() string { return i.name }
 
-// instanceItem adapts an AgentInstance to a panel row.
-type instanceItem struct {
-	*apiv1alpha1.AgentInstance
+// sessionItem adapts a Session to a panel row.
+type sessionItem struct {
+	*apiv1.Session
 }
 
 // FilterValue lets `/` match on template, ID prefix, or state.
-func (i instanceItem) FilterValue() string {
+func (i sessionItem) FilterValue() string {
 	return strings.Join([]string{
-		i.GetAgentTemplate().GetName(),
+		i.GetAgent().GetName(),
 		i.GetId(),
-		instance.StateLabel(i.GetState()),
+		sessionview.StateLabel(i.GetState()),
 	}, " ")
 }
 
 // stateGlyph uses shape, not colour alone, so it survives a monochrome terminal.
-func stateGlyph(state apiv1alpha1.AgentInstanceState) (string, lipgloss.AdaptiveColor) {
+func stateGlyph(state apiv1.RuntimeState) (string, lipgloss.AdaptiveColor) {
 	switch state {
-	case apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_READY:
+	case apiv1.RuntimeState_RUNTIME_STATE_READY:
 		return "●", theme.ColorReady
-	case apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_SUSPENDED:
+	case apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED:
 		return "○", theme.ColorMuted
-	case apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_FAILED:
+	case apiv1.RuntimeState_RUNTIME_STATE_FAILED:
 		return "✗", theme.ColorError
-	case apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_CREATING:
+	case apiv1.RuntimeState_RUNTIME_STATE_CREATING:
 		return "◐", theme.ColorMuted
 	default:
 		return "·", theme.ColorMuted
@@ -129,9 +148,9 @@ func stateGlyph(state apiv1alpha1.AgentInstanceState) (string, lipgloss.Adaptive
 }
 
 // stateBadge renders a lifecycle state as a coloured glyph and label.
-func stateBadge(state apiv1alpha1.AgentInstanceState) string {
+func stateBadge(state apiv1.RuntimeState) string {
 	glyph, colour := stateGlyph(state)
-	return lipgloss.NewStyle().Foreground(colour).Render(glyph + " " + instance.StateLabel(state))
+	return lipgloss.NewStyle().Foreground(colour).Render(glyph + " " + sessionview.StateLabel(state))
 }
 
 // rowDelegate renders one compact line per item, with a cursor on the selection.
@@ -177,15 +196,15 @@ func trimBlankLines(content string) string {
 	return strings.Join(lines, "\n")
 }
 
-// instanceRow renders an AgentInstance row: state glyph, template, short ID.
-func instanceRow(item list.Item, width int) string {
-	row, ok := item.(instanceItem)
+// sessionRow renders a Session row: state glyph, template, short ID.
+func sessionRow(item list.Item, width int) string {
+	row, ok := item.(sessionItem)
 	if !ok {
 		return ""
 	}
 	glyph, colour := stateGlyph(row.GetState())
-	shortID := instance.ShortID(row.GetId())
-	name := truncate(row.GetAgentTemplate().GetName(), max(width-len(shortID)-4, 1))
+	shortID := sessionview.ShortID(row.GetId())
+	name := truncate(row.GetAgent().GetName(), max(width-len(shortID)-4, 1))
 	return fmt.Sprintf("%s %s %s",
 		lipgloss.NewStyle().Foreground(colour).Render(glyph),
 		pad(name, max(width-len(shortID)-4, 1)),

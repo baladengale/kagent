@@ -3,10 +3,10 @@ package models
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/kagent-dev/kagent/go/adk/pkg/internal/azureai"
+	"github.com/kagent-dev/kagent/go/core/pkg/env"
 	"github.com/kagent-dev/kagent/go/pkg/logging"
 )
 
@@ -19,6 +19,8 @@ type FoundryConfig struct {
 	Endpoint   string
 	Deployment string
 	APIVersion string
+
+	StrictOutputSchema *bool
 
 	// credential overrides the Azure credential used for the implicit Workload
 	// Identity auth path. When nil, azureai.NewDefaultCredential is used. It is
@@ -68,7 +70,7 @@ func NewFoundryModel(ctx context.Context, config *FoundryConfig) (*OpenAIModel, 
 	// otherwise the API key when provided, otherwise DefaultAzureCredential
 	// (Workload Identity in-cluster, az CLI in dev), eagerly probed so a
 	// misconfigured identity fails readiness at startup.
-	apiKey := os.Getenv(azureai.FoundryAPIKeyEnvVar)
+	apiKey := env.FoundryAPIKey.Get()
 	if config.APIKeyPassthrough {
 		apiKey = "passthrough"
 	}
@@ -89,9 +91,10 @@ func NewFoundryModel(ctx context.Context, config *FoundryConfig) (*OpenAIModel, 
 	logger.InfoContext(ctx, "initialized Foundry model", "model", config.Model, "deployment", deployment, "endpoint", endpoint, "api_version", apiVersion)
 	return &OpenAIModel{
 		Config: &OpenAIConfig{
-			TransportConfig: config.TransportConfig,
-			Model:           deployment,
-			BaseUrl:         strings.TrimSuffix(endpoint, "/") + "/",
+			TransportConfig:    config.TransportConfig,
+			Model:              deployment,
+			BaseUrl:            strings.TrimSuffix(endpoint, "/") + "/",
+			StrictOutputSchema: config.StrictOutputSchema,
 		},
 		Client:  client,
 		IsAzure: true,
@@ -141,7 +144,7 @@ func NewFoundryAnthropicModel(ctx context.Context, config *AnthropicConfig, endp
 		HTTPClient: httpClient,
 	}
 
-	apiKey := os.Getenv(azureai.FoundryAPIKeyEnvVar)
+	apiKey := env.FoundryAPIKey.Get()
 	if config.APIKeyPassthrough {
 		// Placeholder x-api-key overwritten per request by anthropicPassthroughOpts.
 		apiKey = "passthrough"

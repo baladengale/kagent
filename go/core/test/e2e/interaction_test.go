@@ -6,7 +6,6 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -14,8 +13,8 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	goruntime "runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,16 +26,10 @@ import (
 	a2apb "github.com/a2aproject/a2a-go/v2/a2apb/v1"
 	"github.com/a2aproject/a2a-go/v2/a2apb/v1/pbconv"
 	"github.com/google/uuid"
-	adka2a "github.com/kagent-dev/kagent/go/adk/pkg/a2a"
-	kagenta2a "github.com/kagent-dev/kagent/go/api/a2a"
-	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
-	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	"github.com/kagent-dev/mockllm"
 	"github.com/kagent-dev/mockmcp"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -44,22 +37,29 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+
+	adka2a "github.com/kagent-dev/kagent/go/adk/pkg/a2a"
+	kagenta2a "github.com/kagent-dev/kagent/go/api/a2a"
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
+	"github.com/kagent-dev/kagent/go/api/v1alpha3"
+	kagentenv "github.com/kagent-dev/kagent/go/core/pkg/env"
 )
 
-//go:embed mocks/invoke_agent.json mocks/invoke_golang_hitl_ask_user.json mocks/invoke_mcp_agent.json mocks/invoke_shared_agent.json mocks/invoke_structured_output.json
+//go:embed mocks/invoke_agent.json mocks/invoke_golang_hitl_ask_user.json mocks/invoke_mcp_agent.json mocks/invoke_shared_agent.json mocks/invoke_structured_output.json mocks/invoke_native_ask_user.json
+//go:embed mocks/invoke_mounted_skills.json mocks/invoke_egress_skill.json
 var interactionMocks embed.FS
 
 const structuredOutputSchema = `{"type":"object","properties":{"answer":{"type":"integer"},"explanation":{"type":"string"}},"required":["answer","explanation"],"additionalProperties":false}`
 
-// TestAgentInstanceInteraction verifies the complete public interaction path:
+// TestSessionInteraction verifies the complete public interaction path:
 // gateway routing, Substrate Actor transport, harness execution, and the model call.
-func TestAgentInstanceInteraction(t *testing.T) {
+func TestSessionInteraction(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
 		fixture := newInteractionFixture(t, harness, interactionTarget(t), startInteractionMock(t))
 		_, _, task := fixture.send(t, "What is 2+2?")
 		if task.Status.State != a2atype.TaskStateCompleted {
@@ -78,9 +78,10 @@ func TestAgentInstanceInteraction(t *testing.T) {
 	})
 }
 
-func TestAgentInstanceStructuredOutput(t *testing.T) {
+func TestSessionStructuredOutput(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
 		switch harness.name {
 		case codexE2EHarness, claudeE2EHarness, "byo-adk-e2e":
 			t.Skip("the compiler only supports AgentTemplate outputSchema on the kagent harness")
@@ -88,10 +89,12 @@ func TestAgentInstanceStructuredOutput(t *testing.T) {
 		target := interactionTarget(t)
 		kube := interactionKubeClient(t)
 		mcpURL, mcpServer := startMCPMock(t)
-		template := createStructuredOutputInteractionTemplate(t, harness, kube, startMockLLM(t, "mocks/invoke_structured_output.json"), mcpURL)
+		model := startModelRecorder(t, mockLLMProxy(t, startMockLLMServer(t, interactionMocks, "mocks/invoke_structured_output.json")), nil)
+		template := createStructuredOutputInteractionTemplate(t, harness, kube, reachableModelURL(t, model.URL), mcpURL)
 		fixture := newInteractionFixtureForHarnessTemplate(t, target, harness.name, template.Name)
 		_, _, task := fixture.send(t, "Add 3 and 5 and return the structured result.")
 		assertStructuredOutputTask(t, task, 8, "three plus five equals eight")
+		assertStrictStructuredOutputRequests(t, model.Requests("", ""))
 
 		for _, request := range mcpServer.Requests() {
 			if bytes.Contains(request.Body, []byte(`"method":"tools/call"`)) && bytes.Contains(request.Body, []byte(`"name":"add_numbers"`)) {
@@ -111,6 +114,33 @@ func assertStructuredOutputTask(t *testing.T, task *a2atype.Task, answer float64
 		t.Fatal("structured task has no result artifact")
 	}
 	assertStructuredOutputArtifact(t, task.Artifacts[len(task.Artifacts)-1], answer, explanation)
+}
+
+func assertStrictStructuredOutputRequests(t *testing.T, requests []recordedModelRequest) {
+	t.Helper()
+	var sent int
+	for _, request := range requests {
+		var body struct {
+			ResponseFormat *struct {
+				JSONSchema struct {
+					Strict *bool `json:"strict"`
+				} `json:"json_schema"`
+			} `json:"response_format"`
+		}
+		if err := json.Unmarshal(request.Body, &body); err != nil {
+			t.Fatalf("decode model request: %v", err)
+		}
+		if body.ResponseFormat == nil {
+			continue
+		}
+		sent++
+		if strict := body.ResponseFormat.JSONSchema.Strict; strict == nil || !*strict {
+			t.Fatalf("model request does not set response_format.json_schema.strict to true: %s", request.Body)
+		}
+	}
+	if sent == 0 {
+		t.Fatalf("none of the %d model requests carried the output schema", len(requests))
+	}
 }
 
 func assertStructuredOutputArtifact(t *testing.T, artifact *a2atype.Artifact, answer float64, explanation string) {
@@ -135,6 +165,7 @@ func assertStructuredOutputArtifact(t *testing.T, artifact *a2atype.Artifact, an
 }
 
 func TestOpaqueBYOAgentInteraction(t *testing.T) {
+	t.Parallel()
 	fixture := newInteractionFixtureForHarnessTemplate(t, interactionTarget(t), "byo-e2e", "byo-smoke")
 	for range 2 {
 		_, _, task := fixture.send(t, "hello")
@@ -144,14 +175,11 @@ func TestOpaqueBYOAgentInteraction(t *testing.T) {
 	}
 }
 
-func TestAgentInstanceAskUserSurvivesSuspension(t *testing.T) {
+func TestSessionAskUserSurvivesSuspension(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
-		switch harness.name {
-		case codexE2EHarness, claudeE2EHarness:
-			t.Skip("native ask-user model fixtures are not available yet; this fixture calls the Go ADK ask_user tool")
-		}
-		fixture := newInteractionFixture(t, harness, interactionTarget(t), startMockLLM(t, "mocks/invoke_golang_hitl_ask_user.json"))
+		t.Parallel()
+		fixture := newInteractionFixture(t, harness, interactionTarget(t), startAskUserMock(t, harness))
 		fixture.ctx = metadata.AppendToOutgoingContext(fixture.ctx, strings.ToLower(a2atype.SvcParamExtensions), adka2a.HITLExtensionURI)
 		_, _, waiting := fixture.send(t, "Which database should we use for storage?")
 		if waiting.Status.State != a2atype.TaskStateInputRequired {
@@ -161,23 +189,24 @@ func TestAgentInstanceAskUserSurvivesSuspension(t *testing.T) {
 		if request == nil {
 			t.Fatal("INPUT_REQUIRED task has no ask_user request")
 		}
+		assertActorSuspended(t, fixture)
 		reply := adka2a.AttachHitlExtension(a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("PostgreSQL")), &kagenta2a.AskUserResponse{
 			Type: adka2a.HITLTypeAskUserResponse, ID: request.ID,
 			Answers: []kagenta2a.AskUserAnswer{{Answer: []string{"PostgreSQL"}}},
 		})
 		reply.TaskID, reply.ContextID = waiting.ID, waiting.ContextID
-		response, err := a2agrpc.NewGRPCTransportFromClient(fixture.client).SendMessage(fixture.ctx, nil, &a2atype.SendMessageRequest{Message: reply})
+		response, err := a2agrpc.NewGRPCTransportFromClient(fixture.client).SendMessage(fixture.ctx, nil, &a2atype.SendMessageRequest{Tenant: fixture.tenant, Message: reply})
 		if err != nil {
 			t.Fatalf("resume A2A task: %v", err)
 		}
 		completed, ok := response.(*a2atype.Task)
-		if !ok || completed.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(completed), "Using PostgreSQL") {
+		if !ok || completed.ID != waiting.ID || completed.ContextID != waiting.ContextID || completed.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(completed), "Using PostgreSQL") {
 			t.Fatalf("resumed A2A task = %#v, want completed PostgreSQL response", response)
 		}
 	})
 }
 
-func sendApprovedToolRequest(t *testing.T, fixture *interactionFixture, prompt, wantTool string) *a2atype.Task {
+func sendToolDecision(t *testing.T, fixture *interactionFixture, prompt, wantTool string, approved bool) *a2atype.Task {
 	t.Helper()
 	fixture.ctx = metadata.AppendToOutgoingContext(fixture.ctx, strings.ToLower(a2atype.SvcParamExtensions), kagenta2a.HITLExtensionURI)
 	_, _, waiting := fixture.send(t, prompt)
@@ -195,18 +224,24 @@ func sendApprovedToolRequest(t *testing.T, fixture *interactionFixture, prompt, 
 		t.Fatalf("tool approval request = %+v, want one request for %q", request.Tools, wantTool)
 	}
 
-	reply := a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("Approved"))
+	assertActorSuspended(t, fixture)
+	text := "Denied"
+	if approved {
+		text = "Approved"
+	}
+	reply := a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart(text))
 	reply.TaskID, reply.ContextID = waiting.ID, waiting.ContextID
+	decision := kagenta2a.ToolApproval{ID: request.Tools[0].ID, Approved: approved}
+	if !approved {
+		decision.RejectionReason = "production is serving traffic"
+	}
 	if err := kagenta2a.AttachHITL(reply, kagenta2a.ToolApprovalResponse{
-		Type: kagenta2a.HITLTypeToolApprovalResponse,
-		Approvals: []kagenta2a.ToolApproval{{
-			ID:       request.Tools[0].ID,
-			Approved: true,
-		}},
+		Type:      kagenta2a.HITLTypeToolApprovalResponse,
+		Approvals: []kagenta2a.ToolApproval{decision},
 	}); err != nil {
 		t.Fatalf("attach tool approval response: %v", err)
 	}
-	response, err := a2agrpc.NewGRPCTransportFromClient(fixture.client).SendMessage(fixture.ctx, nil, &a2atype.SendMessageRequest{Message: reply})
+	response, err := a2agrpc.NewGRPCTransportFromClient(fixture.client).SendMessage(fixture.ctx, nil, &a2atype.SendMessageRequest{Tenant: fixture.tenant, Message: reply})
 	if err != nil {
 		t.Fatalf("resume A2A task after tool approval: %v", err)
 	}
@@ -217,14 +252,51 @@ func sendApprovedToolRequest(t *testing.T, fixture *interactionFixture, prompt, 
 	if completed.ID != waiting.ID || completed.ContextID != waiting.ContextID {
 		t.Fatalf("resumed task = %s/%s, want %s/%s", completed.ContextID, completed.ID, waiting.ContextID, waiting.ID)
 	}
+	getRequest, err := pbconv.ToProtoGetTaskRequest(&a2atype.GetTaskRequest{Tenant: fixture.tenant, ID: completed.ID})
+	if err != nil {
+		t.Fatalf("build approval history request: %v", err)
+	}
+	persistedProto, err := fixture.client.GetTask(fixture.ctx, getRequest)
+	if err != nil {
+		t.Fatalf("reload approved task: %v", err)
+	}
+	persisted, err := pbconv.FromProtoTask(persistedProto)
+	if err != nil {
+		t.Fatalf("decode approval history: %v", err)
+	}
+	requestPosition, ok := kagenta2a.TimelinePosition(waiting.Status.Message)
+	if !ok {
+		t.Fatal("approval request has no timeline position")
+	}
+	foundReply := false
+	for _, message := range persisted.History {
+		position, ok := kagenta2a.TimelinePosition(message)
+		if !ok {
+			t.Fatalf("reloaded message %s has no timeline position", message.ID)
+		}
+		if message.ID == reply.ID {
+			foundReply = true
+			if !position.After(requestPosition) {
+				t.Fatal("approval response does not follow its request on the timeline")
+			}
+		}
+	}
+	if !foundReply {
+		t.Fatal("reloaded history is missing the approval response")
+	}
+	for _, artifact := range persisted.Artifacts {
+		if _, ok := kagenta2a.TimelinePosition(artifact); !ok {
+			t.Fatalf("reloaded artifact %s has no timeline position", artifact.ID)
+		}
+	}
 	return completed
 }
 
 // createCheckpoint waits for independent idle snapshot work using one idempotent
 // request. Task completion itself no longer promises checkpoint readiness.
-func createCheckpoint(t *testing.T, ctx context.Context, client apiv1alpha1.CheckpointServiceClient, request *apiv1alpha1.CreateCheckpointRequest) *apiv1alpha1.CreateCheckpointResponse {
+func createCheckpoint(t *testing.T, ctx context.Context, client apiv1.CheckpointServiceClient, request *apiv1.CreateCheckpointRequest) *apiv1.CreateCheckpointResponse {
 	t.Helper()
-	var result *apiv1alpha1.CreateCheckpointResponse
+	var result *apiv1.CreateCheckpointResponse
 	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		var err error
 		result, err = client.CreateCheckpoint(ctx, request)
@@ -241,41 +313,39 @@ func createCheckpoint(t *testing.T, ctx context.Context, client apiv1alpha1.Chec
 	return result
 }
 
-func TestAgentInstanceCheckpoint(t *testing.T) {
+func TestSessionCheckpoint(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
-		if harness.name == "byo-adk-e2e" {
-			t.Skip("the BYO compiler does not configure a durable session store for the Go ADK fixture; forks cannot restore model history")
-		}
+		t.Parallel()
 		fixture := newInteractionFixture(t, harness, interactionTarget(t), startForkMemoryMock(t))
 		_, _, task := fixture.send(t, "What is 2+2?")
-		created := createCheckpoint(t, fixture.ctx, fixture.checkpoints, &apiv1alpha1.CreateCheckpointRequest{
-			AgentInstanceId: fixture.instanceID, RequestId: uuid.NewString(), ExpectedHeadTaskId: string(task.ID),
+		created := createCheckpoint(t, fixture.ctx, fixture.checkpoints, &apiv1.CreateCheckpointRequest{
+			SessionId: fixture.sessionID, RequestId: uuid.NewString(), ExpectedHeadTaskId: string(task.ID),
 		})
 		checkpoint := created.GetCheckpoint()
 		t.Cleanup(func() {
 			cleanupCtx, cleanupCancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "e2e"), 2*time.Minute)
 			defer cleanupCancel()
-			_, cleanupErr := fixture.checkpoints.DeleteCheckpoint(cleanupCtx, &apiv1alpha1.DeleteCheckpointRequest{
+			_, cleanupErr := fixture.checkpoints.DeleteCheckpoint(cleanupCtx, &apiv1.DeleteCheckpointRequest{
 				CheckpointId: checkpoint.GetId(),
 			})
 			if cleanupErr != nil && status.Code(cleanupErr) != codes.NotFound {
 				t.Errorf("delete checkpoint: %v", cleanupErr)
 			}
 		})
-		if checkpoint.GetState() != apiv1alpha1.CheckpointState_CHECKPOINT_STATE_READY ||
+		if checkpoint.GetState() != apiv1.CheckpointState_CHECKPOINT_STATE_READY ||
 			checkpoint.GetHeadTaskId() != string(task.ID) || checkpoint.GetHistorySequence() == 0 {
 			t.Fatalf("checkpoint = %+v, want ready boundary for task %s", checkpoint, task.ID)
 		}
 
-		got, err := fixture.checkpoints.GetCheckpoint(fixture.ctx, &apiv1alpha1.GetCheckpointRequest{
+		got, err := fixture.checkpoints.GetCheckpoint(fixture.ctx, &apiv1.GetCheckpointRequest{
 			CheckpointId: checkpoint.GetId(),
 		})
 		if err != nil || got.GetCheckpoint().GetId() != checkpoint.GetId() {
 			t.Fatalf("get checkpoint = %+v, error %v", got.GetCheckpoint(), err)
 		}
-		listed, err := fixture.checkpoints.ListCheckpoints(fixture.ctx, &apiv1alpha1.ListCheckpointsRequest{
-			AgentInstanceId: fixture.instanceID,
+		listed, err := fixture.checkpoints.ListCheckpoints(fixture.ctx, &apiv1.ListCheckpointsRequest{
+			SessionId: fixture.sessionID,
 		})
 		if err != nil || len(listed.GetCheckpoints()) != 1 || listed.GetCheckpoints()[0].GetId() != checkpoint.GetId() {
 			t.Fatalf("list checkpoints = %+v, error %v", listed.GetCheckpoints(), err)
@@ -286,32 +356,31 @@ func TestAgentInstanceCheckpoint(t *testing.T) {
 		if later.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(later), "The answer is 6.") {
 			t.Fatalf("source continuation state = %s, text = %q; want a new answer after the checkpoint", later.Status.State, taskText(later))
 		}
-		if err := deleteIdleInstance(fixture.ctx, fixture.instances, fixture.instanceID); err != nil {
+		if err := deleteIdleSession(fixture.ctx, fixture.sessions, fixture.sessionID); err != nil {
 			t.Fatalf("delete checkpoint source: %v", err)
 		}
-		forked, err := fixture.checkpoints.ForkAgentInstance(fixture.ctx, &apiv1alpha1.ForkAgentInstanceRequest{
+		forked, err := fixture.checkpoints.ForkSession(fixture.ctx, &apiv1.ForkSessionRequest{
 			CheckpointId: checkpoint.GetId(), RequestId: uuid.NewString(),
 		})
 		if err != nil {
-			t.Fatalf("fork AgentInstance: %v", err)
+			t.Fatalf("fork Session: %v", err)
 		}
-		fork := forked.GetAgentInstance()
-		if fork.GetId() == fixture.instanceID || fork.GetState() != apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_READY {
+		fork := forked.GetSession()
+		if fork.GetId() == fixture.sessionID || fork.GetState() != apiv1.RuntimeState_RUNTIME_STATE_READY {
 			t.Fatalf("fork = %+v", fork)
 		}
 		t.Cleanup(func() {
 			cleanupCtx, cleanupCancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "e2e"), time.Minute)
 			defer cleanupCancel()
-			if cleanupErr := deleteIdleInstance(cleanupCtx, fixture.instances, fork.GetId()); cleanupErr != nil {
-				t.Errorf("delete fork AgentInstance: %v", cleanupErr)
+			if cleanupErr := deleteIdleSession(cleanupCtx, fixture.sessions, fork.GetId()); cleanupErr != nil {
+				t.Errorf("delete fork Session: %v", cleanupErr)
 			}
 		})
 		forkCtx, forkCancel := context.WithTimeout(metadata.AppendToOutgoingContext(t.Context(),
 			"x-user-id", "e2e",
-			"x-kagent-agent-instance-id", fork.GetId(),
 		), 4*time.Minute)
 		t.Cleanup(forkCancel)
-		listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{ContextID: fork.GetContextId(), PageSize: 10})
+		listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{Tenant: fixture.tenant, ContextID: fork.GetContextId(), PageSize: 10})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -320,18 +389,18 @@ func TestAgentInstanceCheckpoint(t *testing.T) {
 			t.Fatalf("list fork tasks: %v", err)
 		}
 		copied, err := pbconv.FromProtoListTasksResponse(copiedResponse)
-		if err != nil || len(copied.Tasks) != 1 || copied.Tasks[0].ID != task.ID || copied.Tasks[0].ContextID != fork.GetContextId() {
+		if err != nil || len(copied.Tasks) != 1 || copied.Tasks[0].ID == task.ID || copied.Tasks[0].ContextID != fork.GetContextId() {
 			t.Fatalf("copied fork tasks = %+v, error %v", copied, err)
 		}
 		// Before its first turn a fork borrows the retained Tag snapshot. Its
 		// copied head boundary must refer to that copy, not the deleted source.
-		forkCheckpoint := createCheckpoint(t, forkCtx, fixture.checkpoints, &apiv1alpha1.CreateCheckpointRequest{
-			AgentInstanceId: fork.GetId(), RequestId: uuid.NewString(), ExpectedHeadTaskId: string(task.ID),
+		forkCheckpoint := createCheckpoint(t, forkCtx, fixture.checkpoints, &apiv1.CreateCheckpointRequest{
+			SessionId: fork.GetId(), RequestId: uuid.NewString(), ExpectedHeadTaskId: string(copied.Tasks[0].ID),
 		})
 		t.Cleanup(func() {
 			ctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "e2e"), time.Minute)
 			defer cancel()
-			_, err := fixture.checkpoints.DeleteCheckpoint(ctx, &apiv1alpha1.DeleteCheckpointRequest{
+			_, err := fixture.checkpoints.DeleteCheckpoint(ctx, &apiv1.DeleteCheckpointRequest{
 				CheckpointId: forkCheckpoint.GetCheckpoint().GetId(),
 			})
 			if err != nil && status.Code(err) != codes.NotFound {
@@ -339,44 +408,44 @@ func TestAgentInstanceCheckpoint(t *testing.T) {
 			}
 		})
 		// A second fork must find the same private runtime conversation even though
-		// neither of its instance authorities ever owned the original session ID.
-		nested, err := fixture.checkpoints.ForkAgentInstance(forkCtx, &apiv1alpha1.ForkAgentInstanceRequest{
+		// neither of its session authorities ever owned the original session ID.
+		nested, err := fixture.checkpoints.ForkSession(forkCtx, &apiv1.ForkSessionRequest{
 			CheckpointId: forkCheckpoint.GetCheckpoint().GetId(), RequestId: uuid.NewString(),
 		})
 		if err != nil {
 			t.Fatalf("fork fresh fork: %v", err)
 		}
-		nestedID := nested.GetAgentInstance().GetId()
+		nestedID := nested.GetSession().GetId()
 		t.Cleanup(func() {
 			ctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "e2e"), time.Minute)
 			defer cancel()
-			if err := deleteIdleInstance(ctx, fixture.instances, nestedID); err != nil {
+			if err := deleteIdleSession(ctx, fixture.sessions, nestedID); err != nil {
 				t.Errorf("delete nested fork: %v", err)
 			}
 		})
-		nestedCtx := metadata.AppendToOutgoingContext(t.Context(), "x-user-id", "e2e", "x-kagent-agent-instance-id", nestedID)
-		nestedFixture := &interactionFixture{ctx: nestedCtx, client: fixture.client}
+		nestedCtx := metadata.AppendToOutgoingContext(t.Context(), "x-user-id", "e2e")
+		nestedFixture := &interactionFixture{ctx: nestedCtx, client: fixture.client, tenant: fixture.tenant, sessionID: nestedID, contextID: nestedID}
 		_, _, nestedTask := nestedFixture.send(t, "What was the answer before the checkpoint?")
 		if nestedTask.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(nestedTask), "The answer is 4.") {
 			t.Fatalf("nested fork task state = %s, text = %q; want checkpoint memory", nestedTask.Status.State, taskText(nestedTask))
 		}
-		if err := deleteIdleInstance(nestedCtx, fixture.instances, nestedID); err != nil {
+		if err := deleteIdleSession(nestedCtx, fixture.sessions, nestedID); err != nil {
 			t.Fatalf("delete nested fork: %v", err)
 		}
-		if _, err := fixture.checkpoints.DeleteCheckpoint(forkCtx, &apiv1alpha1.DeleteCheckpointRequest{
+		if _, err := fixture.checkpoints.DeleteCheckpoint(forkCtx, &apiv1.DeleteCheckpointRequest{
 			CheckpointId: forkCheckpoint.GetCheckpoint().GetId(),
 		}); err != nil {
 			t.Fatalf("delete fresh fork checkpoint: %v", err)
 		}
-		forkFixture := &interactionFixture{ctx: forkCtx, client: fixture.client}
+		forkFixture := &interactionFixture{ctx: forkCtx, client: fixture.client, tenant: fixture.tenant, sessionID: fork.GetId(), contextID: fork.GetId()}
 		_, _, forkTask := forkFixture.send(t, "What was the answer before the checkpoint?")
 		if forkTask.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(forkTask), "The answer is 4.") {
 			t.Fatalf("fork A2A task state = %s, want COMPLETED", forkTask.Status.State)
 		}
-		if err := deleteIdleInstance(forkCtx, fixture.instances, fork.GetId()); err != nil {
-			t.Fatalf("delete fork AgentInstance: %v", err)
+		if err := deleteIdleSession(forkCtx, fixture.sessions, fork.GetId()); err != nil {
+			t.Fatalf("delete fork Session: %v", err)
 		}
-		if _, err := fixture.checkpoints.DeleteCheckpoint(fixture.ctx, &apiv1alpha1.DeleteCheckpointRequest{
+		if _, err := fixture.checkpoints.DeleteCheckpoint(fixture.ctx, &apiv1.DeleteCheckpointRequest{
 			CheckpointId: checkpoint.GetId(),
 		}); err != nil {
 			t.Fatalf("delete checkpoint: %v", err)
@@ -387,6 +456,7 @@ func TestAgentInstanceCheckpoint(t *testing.T) {
 func TestMCPInteraction(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
 		target := interactionTarget(t)
 		mcpURL, mcpServer := startMCPMock(t)
 		template, _ := createMCPInteractionTemplate(t, harness, mcpURL, false)
@@ -407,26 +477,86 @@ func TestMCPInteraction(t *testing.T) {
 func TestMCPToolApproval(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
-		target := interactionTarget(t)
-		mcpURL, mcpServer := startMCPMock(t)
-		template, toolName := createMCPInteractionTemplate(t, harness, mcpURL, true)
-		fixture := newInteractionFixtureForTemplate(t, harness, target, template)
-		completed := sendApprovedToolRequest(t, fixture, "Add 3 and 5 using the configured MCP server.", toolName)
-		if completed.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(completed), "result is 8") {
-			t.Fatalf("approved MCP task state = %s, text = %q", completed.Status.State, taskText(completed))
+		t.Parallel()
+		for _, action := range []string{"approve", "deny", "cancel"} {
+			t.Run(action, func(t *testing.T) {
+				target := interactionTarget(t)
+				mcpURL, mcpServer := startMCPMock(t)
+				template, toolName := createMCPInteractionTemplate(t, harness, mcpURL, true)
+				fixture := newInteractionFixtureForTemplate(t, harness, target, template)
+				const prompt = "Add 3 and 5 using the configured MCP server."
+				if action == "cancel" {
+					fixture.ctx = metadata.AppendToOutgoingContext(fixture.ctx, strings.ToLower(a2atype.SvcParamExtensions), kagenta2a.HITLExtensionURI)
+					_, _, waiting := fixture.send(t, prompt)
+					if waiting.Status.State != a2atype.TaskStateInputRequired {
+						t.Fatalf("task state = %s, want INPUT_REQUIRED", waiting.Status.State)
+					}
+					assertActorSuspended(t, fixture)
+					request, err := pbconv.ToProtoCancelTaskRequest(&a2atype.CancelTaskRequest{Tenant: fixture.tenant, ID: waiting.ID})
+					if err != nil {
+						t.Fatal(err)
+					}
+					response, err := fixture.client.CancelTask(fixture.ctx, request)
+					if err != nil {
+						t.Fatal(err)
+					}
+					canceled, err := pbconv.FromProtoTask(response)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if canceled.ID != waiting.ID || canceled.ContextID != waiting.ContextID || canceled.Status.State != a2atype.TaskStateCanceled {
+						t.Fatalf("cancel result = %#v", canceled)
+					}
+					persisted := getTask(t, fixture, waiting.ID)
+					if persisted.Status.State != a2atype.TaskStateCanceled {
+						t.Fatalf("persisted cancellation state = %s", persisted.Status.State)
+					}
+				} else {
+					completed := sendToolDecision(t, fixture, prompt, toolName, action == "approve")
+					if completed.Status.State != a2atype.TaskStateCompleted {
+						t.Fatalf("MCP task state = %s, text = %q", completed.Status.State, taskText(completed))
+					}
+					if action == "approve" && !strings.Contains(taskText(completed), "result is 8") {
+						t.Fatalf("approved MCP result = %q", taskText(completed))
+					}
+					// ADK emits a confirmation-required response before suspension,
+					// then the actual result on resume. Only resolved responses count
+					// here; duplicate executions or resolved results still fail.
+					events := slices.DeleteFunc(taskToolEvents(getTask(t, fixture, completed.ID)), func(event toolEvent) bool {
+						return event.awaitingConfirmation
+					})
+					assertToolEvents(t, events, toolName)
+				}
+				calls := 0
+				for _, request := range mcpServer.Requests() {
+					if bytes.Contains(request.Body, []byte(`"method":"tools/call"`)) && bytes.Contains(request.Body, []byte(`"name":"add_numbers"`)) {
+						calls++
+					}
+				}
+				want := 0
+				if action == "approve" {
+					want = 1
+				}
+				if calls != want {
+					t.Fatalf("MCP executions = %d, want %d", calls, want)
+				}
+			})
 		}
-		for _, request := range mcpServer.Requests() {
-			if bytes.Contains(request.Body, []byte(`"method":"tools/call"`)) && bytes.Contains(request.Body, []byte(`"name":"add_numbers"`)) {
-				return
-			}
-		}
-		t.Fatal("approved MCP tool did not execute")
 	})
+}
+
+func startAskUserMock(t *testing.T, harness testHarness) string {
+	t.Helper()
+	if harness.name == codexE2EHarness || harness.name == claudeE2EHarness {
+		return startMockLLM(t, "mocks/invoke_native_ask_user.json")
+	}
+	return startMockLLM(t, "mocks/invoke_golang_hitl_ask_user.json")
 }
 
 func TestSharedAgentInteraction(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
 		switch harness.name {
 		case codexE2EHarness:
 			t.Skip("a deterministic Codex subagent model fixture is not available yet")
@@ -436,17 +566,17 @@ func TestSharedAgentInteraction(t *testing.T) {
 		if task.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(task), "Answer from the shared specialist.") {
 			t.Fatalf("A2A task state = %s, text = %q, want completed task with shared child response", task.Status.State, taskText(task))
 		}
-		instances, err := fixture.instances.ListAgentInstances(fixture.ctx, &apiv1alpha1.ListAgentInstancesRequest{})
+		sessions, err := fixture.sessions.ListSessions(fixture.ctx, &apiv1.ListSessionsRequest{})
 		if err != nil {
-			t.Fatalf("list AgentInstances: %v", err)
+			t.Fatalf("list Sessions: %v", err)
 		}
-		for _, instance := range instances.GetAgentInstances() {
-			if instance.GetAgentTemplate().GetName() == fixture.childTemplate {
-				t.Fatalf("Shared child created AgentInstance %q", instance.GetId())
+		for _, session := range sessions.GetSessions() {
+			if session.GetAgent().GetName() == fixture.childTemplate {
+				t.Fatalf("Shared child created Session %q", session.GetId())
 			}
 		}
 
-		listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{ContextID: fixture.contextID})
+		listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{Tenant: fixture.tenant, ContextID: fixture.contextID})
 		if err != nil {
 			t.Fatalf("build ListTasks request: %v", err)
 		}
@@ -460,13 +590,14 @@ func TestSharedAgentInteraction(t *testing.T) {
 	})
 }
 
-func TestAgentInstanceTaskPersistenceAndReconnect(t *testing.T) {
+func TestSessionTaskPersistenceAndReconnect(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
 		fixture := newInteractionFixture(t, harness, interactionTarget(t), startInteractionMock(t))
 		_, _, task := fixture.send(t, "What is 2+2?")
 
-		getRequest, err := pbconv.ToProtoGetTaskRequest(&a2atype.GetTaskRequest{ID: task.ID})
+		getRequest, err := pbconv.ToProtoGetTaskRequest(&a2atype.GetTaskRequest{Tenant: fixture.tenant, ID: task.ID})
 		if err != nil {
 			t.Fatalf("build GetTask request: %v", err)
 		}
@@ -479,10 +610,10 @@ func TestAgentInstanceTaskPersistenceAndReconnect(t *testing.T) {
 			t.Fatalf("decode persisted task: %v", err)
 		}
 		if got.ID != task.ID || got.ContextID != fixture.contextID || got.Status.State != a2atype.TaskStateCompleted {
-			t.Fatalf("persisted task = %#v, want completed task %s in context %s", got, task.ID, fixture.instanceID)
+			t.Fatalf("persisted task = %#v, want completed task %s in context %s", got, task.ID, fixture.sessionID)
 		}
 
-		listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{ContextID: fixture.contextID})
+		listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{Tenant: fixture.tenant, ContextID: fixture.contextID})
 		if err != nil {
 			t.Fatalf("build ListTasks request: %v", err)
 		}
@@ -495,10 +626,10 @@ func TestAgentInstanceTaskPersistenceAndReconnect(t *testing.T) {
 			t.Fatalf("decode listed tasks: %v", err)
 		}
 		if listed.TotalSize != 1 || len(listed.Tasks) != 1 || listed.Tasks[0].ID != task.ID || listed.Tasks[0].ContextID != fixture.contextID {
-			t.Fatalf("listed tasks = %#v, want only task %s in context %s", listed, task.ID, fixture.instanceID)
+			t.Fatalf("listed tasks = %#v, want only task %s in context %s", listed, task.ID, fixture.sessionID)
 		}
 
-		stream, err := fixture.client.SubscribeToTask(fixture.ctx, &a2apb.SubscribeToTaskRequest{Id: string(task.ID)})
+		stream, err := fixture.client.SubscribeToTask(fixture.ctx, &a2apb.SubscribeToTaskRequest{Tenant: fixture.tenant, Id: string(task.ID)})
 		if err != nil {
 			t.Fatalf("reconnect to completed task: %v", err)
 		}
@@ -512,9 +643,10 @@ func TestAgentInstanceTaskPersistenceAndReconnect(t *testing.T) {
 	})
 }
 
-func TestAgentInstanceActiveTask(t *testing.T) {
+func TestSessionActiveTask(t *testing.T) {
 	t.Parallel()
 	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
 		target := interactionTarget(t)
 		modelURL, started := startBlockingInteractionMock(t)
 		fixture := newInteractionFixture(t, harness, target, modelURL)
@@ -525,6 +657,7 @@ func TestAgentInstanceActiveTask(t *testing.T) {
 func testActiveTaskCancellation(t *testing.T, fixture *interactionFixture, started <-chan struct{}) {
 	t.Helper()
 	_, request := newMessageRequest(t, "Wait for cancellation")
+	request.Tenant, request.Message.ContextId = fixture.tenant, fixture.sessionID
 	stream, err := fixture.client.SendStreamingMessage(fixture.ctx, request)
 	if err != nil {
 		t.Fatalf("start streaming A2A message: %v", err)
@@ -535,7 +668,7 @@ func testActiveTaskCancellation(t *testing.T, fixture *interactionFixture, start
 		t.Fatal("runtime did not call the blocking model")
 	}
 
-	listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{ContextID: fixture.contextID})
+	listRequest, err := pbconv.ToProtoListTasksRequest(&a2atype.ListTasksRequest{Tenant: fixture.tenant, ContextID: fixture.contextID})
 	if err != nil {
 		t.Fatalf("build ListTasks request: %v", err)
 	}
@@ -553,11 +686,12 @@ func testActiveTaskCancellation(t *testing.T, fixture *interactionFixture, start
 	task := listed.Tasks[0]
 
 	_, busyRequest := newMessageRequest(t, "Second concurrent request")
+	busyRequest.Tenant, busyRequest.Message.ContextId = fixture.tenant, fixture.sessionID
 	if _, err := fixture.client.SendMessage(fixture.ctx, busyRequest); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("concurrent message error = %v, want %s", err, codes.FailedPrecondition)
 	}
 
-	subscribeRequest, err := pbconv.ToProtoSubscribeToTaskRequest(&a2atype.SubscribeToTaskRequest{ID: task.ID})
+	subscribeRequest, err := pbconv.ToProtoSubscribeToTaskRequest(&a2atype.SubscribeToTaskRequest{Tenant: fixture.tenant, ID: task.ID})
 	if err != nil {
 		t.Fatalf("build SubscribeToTask request: %v", err)
 	}
@@ -577,7 +711,7 @@ func testActiveTaskCancellation(t *testing.T, fixture *interactionFixture, start
 		t.Fatalf("subscribed task = %s, want %s", firstEvent.TaskInfo().TaskID, task.ID)
 	}
 
-	cancelRequest, err := pbconv.ToProtoCancelTaskRequest(&a2atype.CancelTaskRequest{ID: task.ID})
+	cancelRequest, err := pbconv.ToProtoCancelTaskRequest(&a2atype.CancelTaskRequest{Tenant: fixture.tenant, ID: task.ID})
 	if err != nil {
 		t.Fatalf("build CancelTask request: %v", err)
 	}
@@ -596,7 +730,7 @@ func testActiveTaskCancellation(t *testing.T, fixture *interactionFixture, start
 	waitForTaskState(t, stream, a2atype.TaskStateCanceled)
 	assertTaskStreamClosed(t, subscription)
 	assertTaskStreamClosed(t, stream)
-	getRequest, err := pbconv.ToProtoGetTaskRequest(&a2atype.GetTaskRequest{ID: task.ID})
+	getRequest, err := pbconv.ToProtoGetTaskRequest(&a2atype.GetTaskRequest{Tenant: fixture.tenant, ID: task.ID})
 	if err != nil {
 		t.Fatalf("build GetTask request: %v", err)
 	}
@@ -616,11 +750,12 @@ func testActiveTaskCancellation(t *testing.T, fixture *interactionFixture, start
 type interactionFixture struct {
 	ctx         context.Context
 	client      a2apb.A2AServiceClient
-	instances   apiv1alpha1.AgentInstanceServiceClient
-	checkpoints apiv1alpha1.CheckpointServiceClient
-	system      apiv1alpha1.SystemServiceClient
-	instanceID  string
+	sessions    apiv1.SessionServiceClient
+	checkpoints apiv1.CheckpointServiceClient
+	system      apiv1.SystemServiceClient
+	sessionID   string
 	contextID   string
+	tenant      string
 }
 
 type sharedInteractionFixture struct {
@@ -630,10 +765,7 @@ type sharedInteractionFixture struct {
 
 func interactionTarget(t *testing.T) string {
 	t.Helper()
-	rawURL := os.Getenv("KAGENT_E2E_API_URL")
-	if rawURL == "" {
-		rawURL = os.Getenv("KAGENT_API_URL")
-	}
+	rawURL := kagentenv.E2EAPIURL.Get()
 	if rawURL == "" {
 		t.Skip("KAGENT_E2E_API_URL is not set")
 	}
@@ -657,59 +789,55 @@ func newInteractionFixtureForTemplate(t *testing.T, harness testHarness, target,
 
 func newInteractionFixtureForHarnessTemplate(t *testing.T, target, harnessName, templateName string) *interactionFixture {
 	t.Helper()
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("connect to kagent gRPC API: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
+	conn := newControllerConn(t, target)
 	ctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(t.Context(), "x-user-id", "e2e"), 4*time.Minute)
 	t.Cleanup(cancel)
-	instances := apiv1alpha1.NewAgentInstanceServiceClient(conn)
-	request := &apiv1alpha1.CreateAgentInstanceRequest{
-		AgentTemplate: &apiv1alpha1.ResourceReference{Namespace: "kagent", Name: templateName}, Harness: &apiv1alpha1.ResourceReference{Namespace: "kagent", Name: harnessName}, RequestId: uuid.NewString(),
+	sessions := apiv1.NewSessionServiceClient(conn)
+	request := &apiv1.CreateSessionRequest{
+		Agent: &apiv1.ResourceReference{Namespace: "kagent", Name: templateName}, RequestId: uuid.NewString(),
 	}
-	var created *apiv1alpha1.CreateAgentInstanceResponse
-	err = wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
-		created, err = instances.CreateAgentInstance(ctx, request)
+	var created *apiv1.CreateSessionResponse
+	err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		var err error
+		created, err = sessions.CreateSession(ctx, request)
 		if status.Code(err) == codes.FailedPrecondition {
 			return false, nil
 		}
 		return err == nil, err
 	})
 	if err != nil {
-		t.Fatalf("create AgentInstance: %v", err)
+		t.Fatalf("create Session: %v", err)
 	}
-	instance := created.GetAgentInstance()
+	session := created.GetSession()
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "e2e"), time.Minute)
 		defer cleanupCancel()
-		// DeleteAgentInstance returns only after its Substrate Actor has been
+		// DeleteSession returns only after its Substrate Actor has been
 		// suspended and deleted, so this cleanup covers both resources.
-		if cleanupErr := deleteIdleInstance(cleanupCtx, instances, instance.GetId()); cleanupErr != nil {
-			t.Errorf("delete AgentInstance: %v", cleanupErr)
+		if cleanupErr := deleteIdleSession(cleanupCtx, sessions, session.GetId()); cleanupErr != nil {
+			t.Errorf("delete Session: %v", cleanupErr)
 		}
 	})
-	if instance.GetState() != apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_READY {
-		t.Fatalf("created AgentInstance state = %s, want READY", instance.GetState())
+	if session.GetState() != apiv1.RuntimeState_RUNTIME_STATE_READY {
+		t.Fatalf("created Session state = %s, want READY", session.GetState())
 	}
 	return &interactionFixture{
-		ctx: metadata.AppendToOutgoingContext(ctx,
-			"x-kagent-agent-instance-id", instance.GetId(),
-		),
+		ctx:         ctx,
+		tenant:      session.GetAgent().GetNamespace() + "/" + session.GetAgent().GetName(),
 		client:      a2apb.NewA2AServiceClient(conn),
-		instances:   instances,
-		checkpoints: apiv1alpha1.NewCheckpointServiceClient(conn),
-		system:      apiv1alpha1.NewSystemServiceClient(conn),
-		instanceID:  instance.GetId(),
-		contextID:   instance.GetContextId(),
+		sessions:    sessions,
+		checkpoints: apiv1.NewCheckpointServiceClient(conn),
+		system:      apiv1.NewSystemServiceClient(conn),
+		sessionID:   session.GetId(),
+		contextID:   session.GetContextId(),
 	}
 }
 
 // Completion is public before automatic suspension finishes. Cleanup retries
-// only the precondition indicating that lifecycle work still owns the instance.
-func deleteIdleInstance(ctx context.Context, instances apiv1alpha1.AgentInstanceServiceClient, id string) error {
+// only the precondition indicating that lifecycle work still owns the session.
+func deleteIdleSession(ctx context.Context, sessions apiv1.SessionServiceClient, id string) error {
 	return wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {
-		_, err := instances.DeleteAgentInstance(ctx, &apiv1alpha1.DeleteAgentInstanceRequest{AgentInstanceId: id})
+		_, err := sessions.DeleteSession(ctx, &apiv1.DeleteSessionRequest{SessionId: id})
 		switch status.Code(err) {
 		case codes.OK, codes.NotFound:
 			return true, nil
@@ -750,7 +878,10 @@ func newSharedInteractionFixture(t *testing.T, harness testHarness, target strin
 func (f *interactionFixture) send(t *testing.T, text string) (*a2atype.Message, *a2apb.SendMessageRequest, *a2atype.Task) {
 	t.Helper()
 	message, request := newMessageRequest(t, text)
-	response, err := f.client.SendMessage(f.ctx, request)
+	message.ContextID = f.sessionID
+	request.Message.ContextId = f.sessionID
+	request.Tenant = f.tenant
+	response, err := sendMessageWithRetry(f.ctx, f.client, request)
 	if err != nil {
 		t.Fatalf("send A2A message: %v", err)
 	}
@@ -763,6 +894,35 @@ func (f *interactionFixture) send(t *testing.T, text string) (*a2atype.Message, 
 		t.Fatalf("A2A response = %T, want Task", result)
 	}
 	return message, request, task
+}
+
+// sendMessageWithRetry follows the gateway's explicit rejection contract. A
+// quiescence claim or checkpoint can keep dispatch busy past its wait. Retry the
+// same input only when the gateway proves it was never accepted; a generic
+// transport error may hide accepted work and must not cause another execution.
+func sendMessageWithRetry(ctx context.Context, client a2apb.A2AServiceClient, request *a2apb.SendMessageRequest) (*a2apb.SendMessageResponse, error) {
+	var response *a2apb.SendMessageResponse
+	// Bound retries without shortening an accepted request's deadline.
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(context.Context) (bool, error) {
+		var err error
+		response, err = client.SendMessage(ctx, request)
+		if sendNotAccepted(err) {
+			return false, nil
+		}
+		return err == nil, err
+	})
+	return response, err
+}
+
+func sendNotAccepted(err error) bool {
+	if status.Code(err) == codes.FailedPrecondition {
+		for _, detail := range status.Convert(err).Details() {
+			if info, ok := detail.(*errdetails.ErrorInfo); ok && info.Domain == a2atype.ProtocolDomain && info.Metadata["reason"] == "KAGENT_SEND_NOT_ACCEPTED" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func newMessageRequest(t *testing.T, text string) (*a2atype.Message, *a2apb.SendMessageRequest) {
@@ -921,7 +1081,7 @@ func reachableServerURL(t *testing.T, baseURL, path string) string {
 	if err != nil {
 		t.Fatalf("parse mock LLM address: %v", err)
 	}
-	host := os.Getenv("KAGENT_LOCAL_HOST")
+	host := kagentenv.KagentLocalHost.Get()
 	if host == "" {
 		switch goruntime.GOOS {
 		case "darwin":
@@ -929,7 +1089,7 @@ func reachableServerURL(t *testing.T, baseURL, path string) string {
 		case "linux":
 			host = "172.17.0.1"
 		default:
-			t.Fatalf("KAGENT_LOCAL_HOST is required on %s", goruntime.GOOS)
+			t.Fatalf("KAGENT_E2E_LOCAL_HOST is required on %s", goruntime.GOOS)
 		}
 	}
 	if net.ParseIP(host) != nil {
@@ -984,9 +1144,10 @@ func createStructuredOutputInteractionTemplate(t *testing.T, harness testHarness
 			Labels: harness.labels(),
 		},
 		Spec: v1alpha3.AgentTemplateSpec{
-			ModelConfig:  &corev1.LocalObjectReference{Name: model.Name},
-			SystemPrompt: "Use available tools when needed, then return the arithmetic answer and a short explanation.",
-			OutputSchema: &apiextensionsv1.JSON{Raw: []byte(structuredOutputSchema)},
+			ModelConfig:        &corev1.LocalObjectReference{Name: model.Name},
+			SystemPrompt:       "Use available tools when needed, then return the arithmetic answer and a short explanation.",
+			OutputSchema:       &apiextensionsv1.JSON{Raw: []byte(structuredOutputSchema)},
+			OutputSchemaStrict: true,
 			Tools: []v1alpha3.ToolBinding{{MCP: &v1alpha3.MCPToolBinding{
 				Server: corev1.TypedLocalObjectReference{Kind: "RemoteMCPServer", Name: server.Name},
 				Tools:  []string{"add_numbers"},
@@ -1071,7 +1232,7 @@ func createSharedInteractionTemplates(t *testing.T, harness testHarness, modelUR
 			SystemPrompt: "Answer as the shared specialist.",
 		},
 	}
-	createAndWaitInteractionTemplate(t, harness, kube, child)
+	createSharedTemplate(t, kube, child)
 	root := &v1alpha3.AgentTemplate{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "shared-root-", Namespace: "kagent",
@@ -1081,15 +1242,28 @@ func createSharedInteractionTemplates(t *testing.T, harness testHarness, modelUR
 			ModelConfig:  &corev1.LocalObjectReference{Name: rootModel.Name},
 			Description:  "Shared agent interaction E2E fixture",
 			SystemPrompt: "Delegate every request to the specialist.",
-			Tools: []v1alpha3.ToolBinding{{Agent: &v1alpha3.AgentToolBinding{
+			Tools: []v1alpha3.ToolBinding{{SubAgent: &v1alpha3.SubAgentToolBinding{
 				Name: "specialist", Description: "Handles specialist requests",
-				TemplateRef: corev1.LocalObjectReference{Name: child.Name},
-				Isolation:   v1alpha3.AgentToolIsolationShared,
+				TemplateRef: &corev1.LocalObjectReference{Name: child.Name},
 			}}},
 		},
 	}
 	createAndWaitInteractionTemplate(t, harness, kube, root)
 	return root.Name, child.Name
+}
+
+// Shared children are reusable context: no Agent or Harness binding is needed.
+func createSharedTemplate(t *testing.T, kube ctrlclient.Client, template *v1alpha3.AgentTemplate) {
+	t.Helper()
+	template.Labels = nil
+	if err := kube.Create(t.Context(), template); err != nil {
+		t.Fatalf("create shared template: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := kube.Delete(context.Background(), template); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("delete shared template: %v", err)
+		}
+	})
 }
 
 func interactionKubeClient(t *testing.T) ctrlclient.Client {
@@ -1098,17 +1272,7 @@ func interactionKubeClient(t *testing.T) ctrlclient.Client {
 	if err != nil {
 		t.Fatalf("load Kubernetes config: %v", err)
 	}
-	clientScheme := k8sruntime.NewScheme()
-	if err := corev1.AddToScheme(clientScheme); err != nil {
-		t.Fatalf("register Kubernetes core API: %v", err)
-	}
-	if err := discoveryv1.AddToScheme(clientScheme); err != nil {
-		t.Fatalf("register discovery API: %v", err)
-	}
-	if err := v1alpha3.AddToScheme(clientScheme); err != nil {
-		t.Fatalf("register kagent API: %v", err)
-	}
-	kube, err := ctrlclient.New(cfg, ctrlclient.Options{Scheme: clientScheme})
+	kube, err := ctrlclient.New(cfg, ctrlclient.Options{Scheme: suiteKubeScheme})
 	if err != nil {
 		t.Fatalf("create Kubernetes client: %v", err)
 	}
@@ -1167,38 +1331,37 @@ func createAndWaitInteractionTemplateForHarness(t *testing.T, kube ctrlclient.Cl
 		}
 	})
 
-	var lastReady *metav1.Condition
+	agent := &v1alpha3.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: template.Name, Namespace: template.Namespace},
+		Spec: v1alpha3.AgentSpec{
+			Template:   v1alpha3.AgentTemplateSource{Ref: &corev1.LocalObjectReference{Name: template.Name}},
+			HarnessRef: corev1.LocalObjectReference{Name: harnessName},
+		},
+	}
+	if err := kube.Create(t.Context(), agent); err != nil {
+		t.Fatalf("create Agent: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := kube.Delete(context.Background(), agent); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("delete Agent: %v", err)
+		}
+	})
+	// Independent informers can observe the Agent before its references. False
+	// conditions are intermediate observations; wait for the current generation
+	// to become ready and retain all conditions for timeout diagnostics.
 	err := wait.PollUntilContextTimeout(t.Context(), time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
-		if err := kube.Get(ctx, ctrlclient.ObjectKeyFromObject(template), template); err != nil {
+		if err := kube.Get(ctx, ctrlclient.ObjectKeyFromObject(agent), agent); err != nil {
 			return false, err
 		}
-		for _, harness := range template.Status.Harnesses {
-			if harness.Harness != harnessName {
-				continue
-			}
-			for index := range harness.Conditions {
-				condition := &harness.Conditions[index]
-				if condition.Status == metav1.ConditionFalse &&
-					(condition.Type != v1alpha3.AgentTemplateConditionReady || condition.Reason != "ActorTemplatePending") {
-					return false, fmt.Errorf("AgentTemplate %s/%s harness %q condition %s failed: %s: %s",
-						template.Namespace, template.Name, harnessName, condition.Type, condition.Reason, condition.Message)
-				}
-				if condition.Type == v1alpha3.AgentTemplateConditionReady {
-					lastReady = condition.DeepCopy()
-					if condition.Status == metav1.ConditionTrue {
-						return true, nil
-					}
-				}
+		for _, condition := range agent.Status.Conditions {
+			if condition.Type == v1alpha3.AgentConditionReady && condition.ObservedGeneration == agent.Generation {
+				return condition.Status == metav1.ConditionTrue, nil
 			}
 		}
 		return false, nil
 	})
 	if err != nil {
-		if lastReady != nil {
-			t.Fatalf("wait for interaction AgentTemplate %s/%s on harness %q: %v; last Ready condition: status=%s reason=%s message=%q",
-				template.Namespace, template.Name, harnessName, err, lastReady.Status, lastReady.Reason, lastReady.Message)
-		}
-		t.Fatalf("wait for interaction AgentTemplate: %v", err)
+		t.Fatalf("wait for Agent %s/%s: %v; last conditions: %+v", agent.Namespace, agent.Name, err, agent.Status.Conditions)
 	}
 }
 
@@ -1236,7 +1399,7 @@ func startForkMemoryMock(t *testing.T) string {
 	config.OpenAI = append(config.OpenAI, continuation.OpenAI...)
 	config.OpenAIResponse = append(config.OpenAIResponse, continuation.OpenAIResponse...)
 	config.Anthropic = append(config.Anthropic, continuation.Anthropic...)
-	recorder := startModelRecorder(t, startMockLLMConfig(t, config), func(body []byte) error {
+	recorder := startModelRecorder(t, mockLLMProxy(t, startMockLLMConfig(t, config)), func(body []byte) error {
 		if !bytes.Contains(body, []byte("What was the answer before the checkpoint?")) {
 			return nil
 		}
@@ -1264,18 +1427,14 @@ type recordedModelRequest struct {
 	Body   []byte
 }
 
-// startModelRecorder puts a recording proxy in front of the mock LLM at
-// upstreamURL. An inspect function may reject a request: its error is
-// answered with 400 instead of being forwarded, which fails the agent's turn
-// visibly rather than letting the mock answer a prompt it should not see.
-func startModelRecorder(t *testing.T, upstreamURL string, inspect func(body []byte) error) *modelRecorder {
+// startModelRecorder puts a recording server in front of upstream, which is
+// usually a proxy to the mock LLM. An inspect function may reject a request:
+// its error is answered with 400 instead of being forwarded, which fails the
+// agent's turn visibly rather than letting the mock answer a prompt it should
+// not see.
+func startModelRecorder(t *testing.T, upstream http.Handler, inspect func(body []byte) error) *modelRecorder {
 	t.Helper()
-	upstream, err := url.Parse(upstreamURL)
-	if err != nil {
-		t.Fatal(err)
-	}
 	recorder := &modelRecorder{}
-	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -1292,10 +1451,13 @@ func startModelRecorder(t *testing.T, upstreamURL string, inspect func(body []by
 				return
 			}
 		}
+		// Upstream proxies read the body after the response starts, so they
+		// need a reader that the server cannot close under them.
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		proxy.ServeHTTP(w, r)
+		upstream.ServeHTTP(w, r)
 	}))
 	_ = server.Listener.Close()
+	var err error
 	server.Listener, err = net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1304,6 +1466,16 @@ func startModelRecorder(t *testing.T, upstreamURL string, inspect func(body []by
 	t.Cleanup(server.Close)
 	recorder.URL = server.URL
 	return recorder
+}
+
+// mockLLMProxy returns a proxy to the mock LLM at rawURL for startModelRecorder.
+func mockLLMProxy(t *testing.T, rawURL string) *httputil.ReverseProxy {
+	t.Helper()
+	upstream, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return httputil.NewSingleHostReverseProxy(upstream)
 }
 
 // Requests returns the recorded requests carrying the header value, in
@@ -1320,8 +1492,8 @@ func (r *modelRecorder) Requests(header, value string) []recordedModelRequest {
 	return matched
 }
 
-// Gateway credential rules match DNS names. Give host-based mocks a cluster
-// service name without depending on public DNS or changing the gateway config.
+// Gateway credential rules match DNS names. Give host-based mocks a full
+// cluster service name without depending on public DNS or changing the gateway.
 func mockOriginService(t *testing.T, address, port string) string {
 	t.Helper()
 	number, err := strconv.ParseInt(port, 10, 32)
@@ -1347,4 +1519,56 @@ func mockOriginService(t *testing.T, address, port string) string {
 		t.Fatal(err)
 	}
 	return service.Name + "." + service.Namespace + ".svc.cluster.local"
+}
+
+// Exercise first-message creation through the public API, including recovery
+// after a response is lost and the client retries without learning its context.
+func TestAgentA2ACreatesConversation(t *testing.T) {
+	t.Parallel()
+	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
+		fixture := newInteractionFixture(t, harness, interactionTarget(t), startInteractionMock(t))
+		send := func(messageID string) *a2apb.Task {
+			t.Helper()
+			_, request := newMessageRequest(t, "What is 2+2?")
+			request.Tenant, request.Message.MessageId = fixture.tenant, messageID
+			response, err := fixture.client.SendMessage(fixture.ctx, request)
+			if err != nil {
+				t.Fatalf("send without context: %v", err)
+			}
+			task := response.GetTask()
+			if task == nil || task.ContextId == "" {
+				t.Fatalf("expected assigned conversation: %v", response)
+			}
+			return task
+		}
+		initialID := uuid.NewString()
+		first := send(initialID)
+		cleanup := func(id string) {
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "e2e"), time.Minute)
+				defer cancel()
+				if err := deleteIdleSession(ctx, fixture.sessions, id); err != nil {
+					t.Errorf("delete created conversation: %v", err)
+				}
+			})
+		}
+		cleanup(first.ContextId)
+		retry := send(initialID)
+		if retry.ContextId != first.ContextId || retry.Id != first.Id {
+			t.Fatalf("retry created another task/conversation: %v vs %v", first, retry)
+		}
+		second := send(uuid.NewString())
+		cleanup(second.ContextId)
+		if second.ContextId == first.ContextId {
+			t.Fatal("new initial message must create another conversation")
+		}
+		session, err := fixture.sessions.GetSession(fixture.ctx, &apiv1.GetSessionRequest{SessionId: first.ContextId})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if session.GetSession().GetId() != first.ContextId {
+			t.Fatal("public context must identify its Session")
+		}
+	})
 }

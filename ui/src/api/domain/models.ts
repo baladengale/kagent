@@ -1,4 +1,4 @@
-/** ModelConfig domain models, mirroring the `kagent.dev/v1alpha3` ModelConfig CRD. */
+/** ModelConfig domain models, mirroring the `api.kagent.dev/v1alpha3` ModelConfig CRD. */
 
 import type { TLSConfig } from "./common";
 
@@ -32,6 +32,7 @@ export interface AzureOpenAIConfig {
   temperature?: string;
   maxTokens?: number;
   topP?: string;
+  apiFormat?: "chatCompletions" | "responses";
 }
 
 export interface OllamaConfig {
@@ -92,7 +93,7 @@ export interface ModelConfigSpec {
   provider: string;
   apiKeySecret?: string;
   apiKeySecretKey?: string;
-  apiKeyPassthrough?: boolean;
+  tokenPassthrough?: boolean;
   defaultHeaders?: Record<string, string>;
   tls?: TLSConfig;
   openAI?: OpenAIConfig;

@@ -1,5 +1,8 @@
-import { ActorState, type Actor as PbActor, type ActorTemplate as PbActorTemplate, type Worker as PbWorker, SandboxClass } from "@/generated/ateapi_pb";
-import { ScheduledRunService } from "@/generated/kagent/api/v1alpha1/scheduled_runs_pb";
+import { RuntimeState, RuntimeOperation } from "@/generated/kagent/api/v1/runtime_pb";
+import { AgentService, type Agent as PbAgent } from "@/generated/kagent/api/v1/agents_pb";
+import type { Agent, AgentResource } from "../domain/agents";
+import { ActorState, type Actor as PbActor, type ActorTemplate as PbActorTemplate, type Worker as PbWorker, SnapshotStorageStatus } from "@/generated/ateapi_pb";
+import { ScheduledRunService } from "@/generated/kagent/api/v1/scheduled_runs_pb";
 /**
  * What each operation id actually calls.
  *
@@ -38,34 +41,29 @@ import { ScheduledRunService } from "@/generated/kagent/api/v1alpha1/scheduled_r
  * the chat reads boundaries from the list and nothing removes one yet.
  */
 
-import { ModelService } from "@/generated/kagent/api/v1alpha1/models_pb";
-import { ToolService } from "@/generated/kagent/api/v1alpha1/tools_pb";
-import { PromptTemplateService } from "@/generated/kagent/api/v1alpha1/prompts_pb";
+import { ModelService } from "@/generated/kagent/api/v1/models_pb";
+import { ToolService } from "@/generated/kagent/api/v1/tools_pb";
+import { PromptTemplateService } from "@/generated/kagent/api/v1/prompts_pb";
 import {
   SystemService,
-} from "@/generated/kagent/api/v1alpha1/system_pb";
-import { HarnessService } from "@/generated/kagent/api/v1alpha1/harnesses_pb";
-import type { Harness as PbHarness } from "@/generated/kagent/api/v1alpha1/harnesses_pb";
-import { AgentTemplateService } from "@/generated/kagent/api/v1alpha1/agent_templates_pb";
-import type { AgentTemplate as PbAgentTemplate } from "@/generated/kagent/api/v1alpha1/agent_templates_pb";
-import {
-  AgentInstanceOperation as PbAgentInstanceOperation,
-  AgentInstanceService,
-  AgentInstanceSharePermission as PbSharePermission,
-  AgentInstanceState as PbAgentInstanceState,
-} from "@/generated/kagent/api/v1alpha1/agent_instances_pb";
-import type { AgentInstanceShare as PbAgentInstanceShare } from "@/generated/kagent/api/v1alpha1/agent_instances_pb";
-import type { AgentInstance as PbAgentInstance } from "@/generated/kagent/api/v1alpha1/agent_instances_pb";
+} from "@/generated/kagent/api/v1/system_pb";
+import { HarnessService } from "@/generated/kagent/api/v1/harnesses_pb";
+import type { Harness as PbHarness } from "@/generated/kagent/api/v1/harnesses_pb";
+import { AgentTemplateService } from "@/generated/kagent/api/v1/agent_templates_pb";
+import type { AgentTemplate as PbAgentTemplate } from "@/generated/kagent/api/v1/agent_templates_pb";
+import { SessionService } from "@/generated/kagent/api/v1/sessions_pb";
+import type { SessionShare as PbSessionShare } from "@/generated/kagent/api/v1/sessions_pb";
+import type { Session as PbSession } from "@/generated/kagent/api/v1/sessions_pb";
 import {
   CheckpointService,
   CheckpointState as PbCheckpointState,
-} from "@/generated/kagent/api/v1alpha1/checkpoints_pb";
-import type { Checkpoint as PbCheckpoint } from "@/generated/kagent/api/v1alpha1/checkpoints_pb";
-import type { ToolServer as PbToolServer } from "@/generated/kagent/api/v1alpha1/tools_pb";
+} from "@/generated/kagent/api/v1/checkpoints_pb";
+import type { Checkpoint as PbCheckpoint } from "@/generated/kagent/api/v1/checkpoints_pb";
+import type { ToolServer as PbToolServer } from "@/generated/kagent/api/v1/tools_pb";
 import type {
   SubstrateWorkerPool as PbSubstrateWorkerPool,
-} from "@/generated/kagent/api/v1alpha1/system_pb";
-import type { StructuredObject } from "@/generated/kagent/api/v1alpha1/common_pb";
+} from "@/generated/kagent/api/v1/system_pb";
+import type { StructuredObject } from "@/generated/kagent/api/v1/common_pb";
 import { ApiError, fromConnectError, rethrowIfAborted } from "../ApiError";
 import { operationContext, serviceClient } from "../transport";
 import {
@@ -99,7 +97,6 @@ import type {
   AgentInstance,
   AgentInstanceOperation,
   AgentInstanceShare,
-  AgentInstanceSharePermission,
   AgentInstanceState,
 } from "../domain/agentInstances";
 import type { Checkpoint, CheckpointState } from "../domain/checkpoints";
@@ -359,8 +356,7 @@ const toolServers: Pick<
   "mcpServers.create": async (input, options) => {
     const name = "ToolService/CreateToolServer";
     const { payload } = input;
-    const server =
-      payload.type === "RemoteMCPServer" ? payload.remoteMCPServer : payload.mcpServer;
+    const server = payload.remoteMCPServer;
 
     if (!server) {
       throw new ApiError(
@@ -379,7 +375,7 @@ const toolServers: Pick<
           },
           // The envelope's kind is the server type, which is what the handler
           // checks it against (`decodeCreateToolServerResource`).
-          resource: wrap(payload.type, server),
+          resource: wrap(payload.type, server, KAGENT_API_VERSION),
           secrets: payload.secrets ?? [],
         },
         call("mcpServers.create", options),
@@ -539,29 +535,30 @@ function toPromptDetail(template: {
  * place that would otherwise keep quiet about it and render the new state as a
  * blank cell.
  */
-const INSTANCE_STATE_BY_ENUM: Record<PbAgentInstanceState, AgentInstanceState> = {
-  [PbAgentInstanceState.UNSPECIFIED]: "unspecified",
-  [PbAgentInstanceState.CREATING]: "creating",
-  [PbAgentInstanceState.READY]: "ready",
-  [PbAgentInstanceState.SUSPENDED]: "suspended",
-  [PbAgentInstanceState.FAILED]: "failed",
-  [PbAgentInstanceState.DELETING]: "deleting",
-  [PbAgentInstanceState.DELETED]: "deleted",
+const INSTANCE_STATE_BY_ENUM: Record<RuntimeState, AgentInstanceState> = {
+  [RuntimeState.UNSPECIFIED]: "unspecified",
+  [RuntimeState.CREATING]: "creating",
+  [RuntimeState.READY]: "ready",
+  [RuntimeState.SUSPENDED]: "suspended",
+  [RuntimeState.FAILED]: "failed",
+  [RuntimeState.DELETING]: "deleting",
+  [RuntimeState.DELETED]: "deleted",
 };
 
 const INSTANCE_OPERATION_BY_ENUM: Record<
-  PbAgentInstanceOperation,
+  RuntimeOperation,
   AgentInstanceOperation
 > = {
-  [PbAgentInstanceOperation.UNSPECIFIED]: "unspecified",
-  [PbAgentInstanceOperation.CREATE]: "create",
-  [PbAgentInstanceOperation.SUSPEND]: "suspend",
-  [PbAgentInstanceOperation.RESUME]: "resume",
-  [PbAgentInstanceOperation.DELETE]: "delete",
+  [RuntimeOperation.UNSPECIFIED]: "unspecified",
+  [RuntimeOperation.NONE]: "unspecified",
+  [RuntimeOperation.CREATE]: "create",
+  [RuntimeOperation.SUSPEND]: "suspend",
+  [RuntimeOperation.RESUME]: "resume",
+  [RuntimeOperation.DELETE]: "delete",
 };
 
 /**
- * One `AgentInstance` message as the record every instance screen reads.
+ * Map a Session protobuf into the existing conversation view model.
  *
  * Nothing is unwrapped here: an instance is a row in the controller's database
  * rather than a custom resource, so there is no `StructuredObject` in the way —
@@ -573,7 +570,7 @@ const INSTANCE_OPERATION_BY_ENUM: Record<
  * `undefined`. Falling through to `"unknown"` puts that on screen as an unknown
  * state instead of an empty cell.
  */
-function toAgentInstance(instance: PbAgentInstance): AgentInstance {
+function toAgentInstance(instance: PbSession): AgentInstance {
   return {
     id: instance.id,
     contextId: instance.contextId,
@@ -583,8 +580,7 @@ function toAgentInstance(instance: PbAgentInstance): AgentInstance {
     // spellings of the same fact.
     name: instance.name,
     creator: instance.creator,
-    harness: orUndefined(refToString(instance.harness)),
-    agentTemplate: orUndefined(refToString(instance.agentTemplate)),
+    agent: orUndefined(refToString(instance.agent)),
     preparedRevision: orUndefined(instance.preparedRevision),
     a2aAuthority: orUndefined(instance.a2aAuthority),
     state: INSTANCE_STATE_BY_ENUM[instance.state] ?? "unknown",
@@ -619,32 +615,10 @@ function toAgentInstance(instance: PbAgentInstance): AgentInstance {
  */
 const INSTANCE_PAGE_LIMIT = 50;
 
-/** Which permission the wire spells, both ways. */
-const SHARE_PERMISSION_TO_PB = {
-  readOnly: PbSharePermission.READ_ONLY,
-  readWrite: PbSharePermission.READ_WRITE,
-} as const;
-
-const SHARE_PERMISSION_FROM_PB: Partial<
-  Record<PbSharePermission, AgentInstanceSharePermission>
-> = {
-  [PbSharePermission.READ_ONLY]: "readOnly",
-  [PbSharePermission.READ_WRITE]: "readWrite",
-};
-
-/**
- * One share record.
- *
- * An unrecognised permission reads as `readOnly` rather than as the permissive
- * one — which is also what the controller does, treating anything that is not
- * `READ_WRITE` as read-only. A build newer than this one adding a permission must
- * not have it silently widen access here.
- */
-function toAgentInstanceShare(share: PbAgentInstanceShare): AgentInstanceShare {
+function toAgentInstanceShare(share: PbSessionShare): AgentInstanceShare {
   return {
     id: share.id,
-    agentInstanceId: share.agentInstanceId,
-    permission: SHARE_PERMISSION_FROM_PB[share.permission] ?? "readOnly",
+    agentInstanceId: share.sessionId,
     createdAt: isoFrom(share.createdAt),
   };
 }
@@ -667,7 +641,7 @@ const CHECKPOINT_STATE_FROM_PB: Partial<Record<PbCheckpointState, CheckpointStat
 function toCheckpoint(checkpoint: PbCheckpoint): Checkpoint {
   return {
     id: checkpoint.id,
-    agentInstanceId: checkpoint.agentInstanceId,
+    agentInstanceId: checkpoint.sessionId,
     name: checkpoint.name,
     headTaskId: checkpoint.headTaskId,
     state: CHECKPOINT_STATE_FROM_PB[checkpoint.state] ?? "unknown",
@@ -696,27 +670,18 @@ const agentInstances: Pick<
   | "agentInstances.resume"
 > = {
   "agentInstances.list": async (input, options) => {
-    const name = "AgentInstanceService/ListAgentInstances";
+    const name = "SessionService/ListSessions";
     const rows: AgentInstance[] = [];
     let pageToken = "";
 
     for (let page = 0; page < INSTANCE_PAGE_LIMIT; page += 1) {
       const response = await rpc(name, options.signal, () =>
-        serviceClient(AgentInstanceService).listAgentInstances(
+        serviceClient(SessionService).listSessions(
           {
             allCreators: input.allCreators ?? false,
-            /*
-             * One agent's conversations, narrowed by the server.
-             *
-             * Both fields are optional and either may be given alone. The controller
-             * resolves them through `prepared_revision` to the pair the instance was
-             * built from, so they also select instances stored before the fields
-             * existed — and, more importantly, so the narrowing happens before the
-             * page is cut. Filtering a page after fetching it searches only what
-             * was fetched: a match on page nine reads as "no conversations".
-             */
-            agentTemplate: input.agentTemplate,
-            harness: input.harness,
+            // Filter by Agent on the server before pagination, so conversations
+            // on later pages are included in the results.
+            agent: input.agent,
             // No `limit`: the controller's own default (50) is a better answer than
             // a number invented here, and it rejects anything over 100 outright.
             page: { pageToken },
@@ -725,7 +690,7 @@ const agentInstances: Pick<
         ),
       );
 
-      rows.push(...list(response.agentInstances).map(toAgentInstance));
+      rows.push(...list(response.sessions).map(toAgentInstance));
 
       const next = response.page?.nextPageToken ?? "";
       if (!next) return rows;
@@ -748,12 +713,11 @@ const agentInstances: Pick<
   },
 
   "agentInstances.create": async (input, options) => {
-    const name = "AgentInstanceService/CreateAgentInstance";
+    const name = "SessionService/CreateSession";
     const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentInstanceService).createAgentInstance(
+      serviceClient(SessionService).createSession(
         {
-          harness: input.harness,
-          agentTemplate: input.agentTemplate,
+          agent: input.agent,
           requestId: input.requestId,
           // Optional, and empty means unnamed rather than untitled-by-mistake: a
           // conversation started from a "New chat" button has nothing to be called
@@ -764,7 +728,7 @@ const agentInstances: Pick<
         call("agentInstances.create", options),
       ),
     );
-    return toAgentInstance(required(response.agentInstance, name, "created agent instance"));
+    return toAgentInstance(required(response.session, name, "created agent instance"));
   },
 
   /*
@@ -781,14 +745,14 @@ const agentInstances: Pick<
    * identified by its id.
    */
   "agentInstances.rename": async (input, options) => {
-    const name = "AgentInstanceService/UpdateAgentInstanceName";
+    const name = "SessionService/UpdateSessionName";
     const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentInstanceService).updateAgentInstanceName(
-        { agentInstanceId: input.id, name: input.name },
+      serviceClient(SessionService).updateSessionName(
+        { sessionId: input.id, name: input.name },
         call("agentInstances.rename", options),
       ),
     );
-    return toAgentInstance(required(response.agentInstance, name, "renamed agent instance"));
+    return toAgentInstance(required(response.session, name, "renamed agent instance"));
   },
 
   /*
@@ -808,7 +772,7 @@ const agentInstances: Pick<
       try {
         created = await rpc(name, options.signal, () =>
           serviceClient(CheckpointService).createCheckpoint(
-            { agentInstanceId: input.id, requestId: input.requestId, expectedHeadTaskId: input.expectedHeadTaskId },
+            { sessionId: input.id, requestId: input.requestId, expectedHeadTaskId: input.expectedHeadTaskId },
             call("agentInstances.checkpoints.create", options),
           ),
         );
@@ -839,7 +803,7 @@ const agentInstances: Pick<
     const name = "CheckpointService/ListCheckpoints";
     const response = await rpc(name, options.signal, () =>
       serviceClient(CheckpointService).listCheckpoints(
-        { agentInstanceId: input.id },
+        { sessionId: input.id },
         call("agentInstances.checkpoints.list", options),
       ),
     );
@@ -851,20 +815,20 @@ const agentInstances: Pick<
   /*
    * The fork of a boundary saved earlier, which is where the history it holds stops.
    *
-   * `ForkAgentInstance` names the fork after the snapshot, so the chat sends no name
+   * `ForkSession` names the fork after the snapshot, so the chat sends no name
    * and takes that. `name` is for the caller that wants something else — duplicating a
    * conversation from the rail, which titles the copy after the conversation — and it
    * costs a second call because the fork RPC has nowhere to put it.
    */
   "agentInstances.checkpoints.fork": async (input, options) => {
-    const name = "CheckpointService/ForkAgentInstance";
+    const name = "CheckpointService/ForkSession";
     const forked = await rpc(name, options.signal, () =>
-      serviceClient(CheckpointService).forkAgentInstance(
+      serviceClient(CheckpointService).forkSession(
         { checkpointId: input.checkpointId, requestId: input.requestId },
         call("agentInstances.checkpoints.fork", options),
       ),
     );
-    const instance = toAgentInstance(required(forked.agentInstance, name, "forked agent instance"));
+    const instance = toAgentInstance(required(forked.session, name, "forked agent instance"));
     if (!input.name) return instance;
     return agentInstances["agentInstances.rename"]({ id: instance.id, name: input.name }, options);
   },
@@ -901,7 +865,9 @@ const agentInstances: Pick<
    * retry cannot leave a second checkpoint or a second fork behind.
    */
   "agentInstances.fork": async (input, options) => {
-    const history = await getChatClient().history({ id: input.id }, options);
+    const source = await agentInstances["agentInstances.get"]({ id: input.id }, options);
+    const agent = required(source.agent, "SessionService/GetSession", "agent reference");
+    const history = await getChatClient().history({ id: input.id, agent }, options);
     const expectedHeadTaskId = history.messages.at(-1)?.taskId;
     if (!expectedHeadTaskId) throw new ApiError("There is no completed turn to fork.", { kind: "http", url: "CheckpointService/CreateCheckpoint", status: 400 });
     const checkpoint = await agentInstances["agentInstances.checkpoints.create"](
@@ -920,19 +886,19 @@ const agentInstances: Pick<
    * nothing left to show, and handing back a row invites rendering one.
    */
   "agentInstances.delete": async (input, options) => {
-    await rpc("AgentInstanceService/DeleteAgentInstance", options.signal, () =>
-      serviceClient(AgentInstanceService).deleteAgentInstance(
-        { agentInstanceId: input.id },
+    await rpc("SessionService/DeleteSession", options.signal, () =>
+      serviceClient(SessionService).deleteSession(
+        { sessionId: input.id },
         call("agentInstances.delete", options),
       ),
     );
   },
 
   "agentInstances.shares.list": async (input, options) => {
-    const name = "AgentInstanceService/ListAgentInstanceShares";
+    const name = "SessionService/ListSessionShares";
     const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentInstanceService).listAgentInstanceShares(
-        { agentInstanceId: input.id },
+      serviceClient(SessionService).listSessionShares(
+        { sessionId: input.id },
         call("agentInstances.shares.list", options),
       ),
     );
@@ -940,12 +906,11 @@ const agentInstances: Pick<
   },
 
   "agentInstances.shares.create": async (input, options) => {
-    const name = "AgentInstanceService/CreateAgentInstanceShare";
+    const name = "SessionService/CreateSessionShare";
     const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentInstanceService).createAgentInstanceShare(
+      serviceClient(SessionService).createSessionShare(
         {
-          agentInstanceId: input.id,
-          permission: SHARE_PERMISSION_TO_PB[input.permission],
+          sessionId: input.id,
         },
         call("agentInstances.shares.create", options),
       ),
@@ -959,8 +924,8 @@ const agentInstances: Pick<
   },
 
   "agentInstances.shares.revoke": async (input, options) => {
-    await rpc("AgentInstanceService/RevokeAgentInstanceShare", options.signal, () =>
-      serviceClient(AgentInstanceService).revokeAgentInstanceShare(
+    await rpc("SessionService/RevokeSessionShare", options.signal, () =>
+      serviceClient(SessionService).revokeSessionShare(
         { shareId: input.shareId },
         call("agentInstances.shares.revoke", options),
       ),
@@ -968,14 +933,14 @@ const agentInstances: Pick<
   },
 
   "agentInstances.get": async (input, options) => {
-    const name = "AgentInstanceService/GetAgentInstance";
+    const name = "SessionService/GetSession";
     const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentInstanceService).getAgentInstance(
-        { agentInstanceId: input.id },
+      serviceClient(SessionService).getSession(
+        { sessionId: input.id },
         call("agentInstances.get", options),
       ),
     );
-    return toAgentInstance(required(response.agentInstance, name, "agent instance"));
+    return toAgentInstance(required(response.session, name, "agent instance"));
   },
 
   /*
@@ -986,25 +951,25 @@ const agentInstances: Pick<
    * something it already has.
    */
   "agentInstances.suspend": async (input, options) => {
-    const name = "AgentInstanceService/SuspendAgentInstance";
+    const name = "SessionService/SuspendSession";
     const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentInstanceService).suspendAgentInstance(
-        { agentInstanceId: input.id },
+      serviceClient(SessionService).suspendSession(
+        { sessionId: input.id },
         call("agentInstances.suspend", options),
       ),
     );
-    return toAgentInstance(required(response.agentInstance, name, "agent instance"));
+    return toAgentInstance(required(response.session, name, "agent instance"));
   },
 
   "agentInstances.resume": async (input, options) => {
-    const name = "AgentInstanceService/ResumeAgentInstance";
+    const name = "SessionService/ResumeSession";
     const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentInstanceService).resumeAgentInstance(
-        { agentInstanceId: input.id },
+      serviceClient(SessionService).resumeSession(
+        { sessionId: input.id },
         call("agentInstances.resume", options),
       ),
     );
-    return toAgentInstance(required(response.agentInstance, name, "agent instance"));
+    return toAgentInstance(required(response.session, name, "agent instance"));
   },
 };
 
@@ -1040,10 +1005,7 @@ function toAgentTemplate(template: PbAgentTemplate): AgentTemplate {
     name: template.ref?.name ?? "",
     modelConfigRef: refToString(template.modelConfigRef),
     description: template.description,
-    // Reported in status and derivable only from the harness side — a harness
-    // admits templates through a label selector, so nothing on a template says
-    // which ones match it.
-    admittingHarnesses: list(template.admittingHarnesses),
+
     resource: templateResource(template, "AgentTemplateService/ListAgentTemplates"),
   };
 }
@@ -1056,6 +1018,77 @@ function templateResource(template: PbAgentTemplate, rpc: string): AgentTemplate
     `agent template ${template.ref?.name ?? ""}`,
   );
 }
+
+function toAgent(agent: PbAgent): Agent {
+ return {ref: refToString(agent.ref), namespace: agent.ref?.namespace ?? "", name: agent.ref?.name ?? "", resource: unwrap<AgentResource>(agent.resource, "AgentService", "Agent")};
+}
+const agents: Pick<ApiOperations, "agents.list" | "agents.get" | "agents.create" | "agents.update" | "agents.delete"> = {
+  "agents.list": async (input, options) => {
+    const response = await rpc(
+      "AgentService/ListAgents",
+      options.signal,
+      () =>
+        serviceClient(AgentService).listAgents(
+          { namespace: input.namespace ?? "" },
+          call("agents.list", options),
+        ),
+    );
+    return list(response.agents).map(toAgent);
+  },
+
+  "agents.get": async (input, options) => {
+    const name = "AgentService/GetAgent";
+    const response = await rpc(name, options.signal, () =>
+      serviceClient(AgentService).getAgent(
+        { ref: { namespace: input.namespace, name: input.name } },
+        call("agents.get", options),
+      ),
+    );
+    return toAgent(
+      required(response.agent, name, `agent template ${input.name}`),
+    );
+  },
+
+
+  "agents.create": async (input, options) => {
+    const name = "AgentService/CreateAgent";
+    const response = await rpc(name, options.signal, () =>
+      serviceClient(AgentService).createAgent(
+        {
+          ref: { namespace: input.namespace, name: input.name },
+          resource: wrap("Agent", input.resource),
+        },
+        call("agents.create", options),
+      ),
+    );
+    return toAgent(required(response.agent, name, "created agent template"));
+  },
+
+  "agents.update": async (input, options) => {
+    const name = "AgentService/UpdateAgent";
+    const response = await rpc(name, options.signal, () =>
+      serviceClient(AgentService).updateAgent(
+        {
+          ref: { namespace: input.namespace, name: input.name },
+          resource: wrap("Agent", input.resource),
+        },
+        call("agents.update", options),
+      ),
+    );
+    return toAgent(
+      required(response.agent, name, `agent template ${input.name}`),
+    );
+  },
+
+  "agents.delete": async (input, options) => {
+    await rpc("AgentService/DeleteAgent", options.signal, () =>
+      serviceClient(AgentService).deleteAgent(
+        { ref: { namespace: input.namespace, name: input.name } },
+        call("agents.delete", options),
+      ),
+    );
+  },
+};
 
 const agentBuildingBlocks: Pick<
   ApiOperations,
@@ -1127,17 +1160,7 @@ const agentBuildingBlocks: Pick<
     );
   },
 
-  /*
-   * Create and update both send the whole custom resource.
-   *
-   * `metadata.labels` ride with it, and they decide whether the template can be
-   * used at all: a Harness admits templates through a label selector, and the CRD
-   * says one with no selector admits none.
-   *
-   * The controller forces `metadata.name` and `metadata.namespace` to agree with
-   * the ref — `decodeResource` rejects a payload naming a different object — so the
-   * ref is the address and the resource is the content.
-   */
+
   "agentTemplates.create": async (input, options) => {
     const name = "AgentTemplateService/CreateAgentTemplate";
     const response = await rpc(name, options.signal, () =>
@@ -1213,10 +1236,6 @@ function toActorTemplateEntry(
       ? "Failed"
       : golden?.goldenTag ? "Ready" : "Pending",
     goldenTag: golden?.goldenTag ? `${golden.goldenTag.atespace}/${golden.goldenTag.name}` : undefined,
-    sandboxClass:
-      SandboxClass[
-        actorTemplate.sandboxConfig?.sandboxClass ?? SandboxClass.UNSPECIFIED
-      ]?.toLowerCase(),
     workerSelector: orUndefined(
       Object.entries(actorTemplate.workerSelector?.matchLabels ?? {})
         .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
@@ -1233,8 +1252,6 @@ const ACTOR_STATUS_LABELS: Record<ActorState, string> = {
   [ActorState.RUNNING]: "Running",
   [ActorState.SUSPENDING]: "Suspending",
   [ActorState.SUSPENDED]: "Suspended",
-  [ActorState.PAUSING]: "Pausing",
-  [ActorState.PAUSED]: "Paused",
   [ActorState.CRASHED]: "ACTOR_STATE_CRASHED",
   [ActorState.DELETING]: "ACTOR_STATE_DELETING",
   [ActorState.REVERTING]: "Reverting",
@@ -1244,18 +1261,24 @@ function toActorEntry(actor: PbActor): SubstrateActorEntry {
   const metadata = required(actor.metadata, "Substrate", "actor metadata");
   const state = actor.status?.state ?? ActorState.UNSPECIFIED;
   const assignment = actor.status?.workerAssignment;
+  const snapshots = [...(actor.status?.snapshots ?? [])].sort((a, b) => b.generation - a.generation);
+  const latest = snapshots[0];
+  const paused = state === ActorState.SUSPENDED && latest?.locality && !latest.durableSnapshot;
+  const durable = snapshots.find((snapshot) => snapshot.durableSnapshot?.status === SnapshotStorageStatus.COMPLETED);
+  const pending = snapshots.find((snapshot) => snapshot.durableSnapshot?.status === SnapshotStorageStatus.PENDING
+    || (state === ActorState.SUSPENDING && !snapshot.locality && !snapshot.durableSnapshot));
   return {
     actorId: metadata.name,
     atespace: metadata.atespace,
-    status: ACTOR_STATUS_LABELS[state] ?? String(state),
+    status: paused ? "Paused" : ACTOR_STATUS_LABELS[state] ?? String(state),
     actorTemplateAtespace: orUndefined(actor.actorTemplate?.atespace),
     actorTemplateName: orUndefined(actor.actorTemplate?.name),
     ateomPodNamespace: orUndefined(assignment?.workerNamespace),
     ateomPodName: orUndefined(assignment?.workerPod),
-    ateomPodIp: orUndefined(assignment?.workerPodIp),
-    latestSnapshot: orUndefined(actor.status?.externalSnapshot?.snapshotUri),
+    ateomPodIp: orUndefined(assignment?.workerPodIps[0]),
+    latestSnapshot: orUndefined(durable?.durableSnapshot?.object?.snapshotUri),
     workerPoolName: orUndefined(assignment?.workerPool),
-    inProgressSnapshot: orUndefined(actor.status?.inProgressLocalSnapshotName),
+    inProgressSnapshot: orUndefined(pending?.uuid),
     version: toNumber(metadata.version),
   };
 }
@@ -1265,7 +1288,7 @@ function toWorkerEntry(worker: PbWorker): SubstrateWorkerEntry {
     workerNamespace: worker.workerNamespace,
     workerPool: worker.workerPool,
     workerPod: worker.workerPod,
-    ip: orUndefined(worker.ip),
+    ip: orUndefined(worker.status?.ips[0]),
     version: toNumber(worker.metadata?.version),
   };
 }
@@ -1375,6 +1398,7 @@ function required<T>(value: T | undefined, rpcName: string, what: string): T {
  * declared in `OperationMap` without appearing here — the compiler insists.
  */
 export const defaultOperations: ApiOperations = {
+ ...agents,
   ...agentBuildingBlocks,
   ...models,
   ...toolServers,

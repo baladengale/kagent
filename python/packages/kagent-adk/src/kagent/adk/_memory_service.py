@@ -12,13 +12,22 @@ from google.adk.models import BaseLlm
 from google.adk.sessions import Session
 from google.genai import types
 from google.protobuf import json_format, struct_pb2
-from kagent.api.v1alpha1 import memory_pb2
 from kagent.core import AsyncControllerClient
+from kagent.runtime.v1 import memory_pb2
 
+from kagent.adk._request_identity import request_user_id
 from kagent.adk.models import KAgentEmbedding
 from kagent.adk.types import EmbeddingConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _memory_user_id() -> str:
+    # ADK user IDs are native storage keys, not the owner of long-term memory.
+    user_id = request_user_id.get()
+    if not user_id:
+        raise ValueError("memory requires caller identity")
+    return user_id
 
 
 class KagentMemoryService(BaseMemoryService):
@@ -32,7 +41,6 @@ class KagentMemoryService(BaseMemoryService):
 
     def __init__(
         self,
-        agent_name: str,
         controller_client: AsyncControllerClient,
         embedding_config: Optional[EmbeddingConfig] = None,
         ttl_days: int = 0,
@@ -40,12 +48,10 @@ class KagentMemoryService(BaseMemoryService):
         """Initialize KagentMemoryService.
 
         Args:
-            agent_name: Name of the agent (used as namespace in storage)
             controller_client: Shared authenticated controller gRPC client
             embedding_config: Configuration for embedding model (EmbeddingConfig only).
             ttl_days: TTL for memory entries in days. 0 means use the server default.
         """
-        self.agent_name = agent_name
         self.client = controller_client
         self.embedding_config = embedding_config
         self.ttl_days = ttl_days
@@ -62,6 +68,9 @@ class KagentMemoryService(BaseMemoryService):
             session: The session to add to memory
             model: Optional ADK model object (e.g., OpenAI, KAgentAnthropicLlm) to use for summarization.
         """
+        # Validate before scheduling so the caller receives the error. The task
+        # inherits this request's ContextVars, even after the executor resets them.
+        _memory_user_id()
         asyncio.create_task(self._add_session_to_memory_background(session, model))
 
     async def _add_session_to_memory_background(self, session: Session, model: Optional[Any] = None) -> None:
@@ -74,6 +83,7 @@ class KagentMemoryService(BaseMemoryService):
             session: The session to add to memory
             model: Optional ADK model object (e.g., OpenAI, KAgentAnthropicLlm) to use for summarization.
         """
+        user_id = _memory_user_id()
         try:
             # Extract content from session events
             raw_content = self._extract_session_content(session)
@@ -81,7 +91,7 @@ class KagentMemoryService(BaseMemoryService):
                 logger.debug("No content to add to memory from session %s", session.id)
                 return
 
-            logger.debug("Adding session %s to memory for user %s", session.id, session.user_id)
+            logger.debug("Adding session %s to memory for user %s", session.id, user_id)
 
             # Summarize content before embedding
             # Returns a list of strings (individual facts/memories)
@@ -111,8 +121,6 @@ class KagentMemoryService(BaseMemoryService):
                     continue
 
                 item = memory_pb2.SessionMemoryInput(
-                    agent_name=self.agent_name,
-                    user_id=session.user_id,
                     content=content_item,
                     vector=vector,
                 )
@@ -125,7 +133,7 @@ class KagentMemoryService(BaseMemoryService):
 
             response = await self.client.memory_service.AddSessionBatch(
                 memory_pb2.MemoryServiceAddSessionBatchRequest(items=batch_items),
-                **await self.client.call_options(session.user_id),
+                **await self.client.call_options(user_id),
             )
             logger.info("Successfully saved %d memory items via batch RPC", response.count)
         except Exception as e:
@@ -135,7 +143,6 @@ class KagentMemoryService(BaseMemoryService):
         self,
         *,
         app_name: str,
-        user_id: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -143,10 +150,10 @@ class KagentMemoryService(BaseMemoryService):
 
         Args:
             app_name: The application name
-            user_id: The user ID
             content: The text content to save
             metadata: Optional additional metadata
         """
+        user_id = _memory_user_id()
         if not content:
             return
 
@@ -162,8 +169,6 @@ class KagentMemoryService(BaseMemoryService):
             return
 
         memory = memory_pb2.SessionMemoryInput(
-            agent_name=self.agent_name,
-            user_id=user_id,
             content=content,
             vector=vector,
         )
@@ -193,13 +198,14 @@ class KagentMemoryService(BaseMemoryService):
         """Search memory for relevant content.
 
         Args:
-            app_name: The application name (used for filtering)
-            user_id: The user ID to search within
+            app_name: ADK compatibility parameter; scope comes from the actor's session.
+            user_id: ADK compatibility parameter; ownership comes from the actor's session.
             query: The search query text
 
         Returns:
             SearchMemoryResponse containing matching MemoryEntry objects
         """
+        user_id = _memory_user_id()
         # Generate embedding for the query
         if not self._embedding_client:
             logger.warning("No embedding client available for search")
@@ -212,8 +218,6 @@ class KagentMemoryService(BaseMemoryService):
         try:
             response = await self.client.memory_service.Search(
                 memory_pb2.MemoryServiceSearchRequest(
-                    agent_name=self.agent_name,
-                    user_id=user_id,
                     vector=vector,
                     limit=5,
                     min_score=0.3,

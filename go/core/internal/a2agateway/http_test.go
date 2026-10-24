@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,16 +19,16 @@ import (
 	a2agrpc "github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
 	a2apb "github.com/a2aproject/a2a-go/v2/a2apb/v1"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
-	apia2a "github.com/kagent-dev/kagent/go/api/a2a"
-	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
-	"github.com/kagent-dev/kagent/go/core/internal/database"
-	"github.com/kagent-dev/kagent/go/core/internal/grpcserver"
-	"github.com/kagent-dev/kagent/go/core/internal/service/agentinstance"
-	systemservice "github.com/kagent-dev/kagent/go/core/internal/service/system"
-	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
+	"github.com/kagent-dev/kagent/go/core/internal/database"
+	"github.com/kagent-dev/kagent/go/core/internal/grpcserver"
+	sessionsvc "github.com/kagent-dev/kagent/go/core/internal/service/session"
+	systemservice "github.com/kagent-dev/kagent/go/core/internal/service/system"
+	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 )
 
 type httpTestAuthenticator struct {
@@ -40,19 +41,18 @@ func (httpTestAuthenticator) Authenticate(_ context.Context, headers http.Header
 	if headers.Get("Authorization") != "Bearer valid" {
 		return nil, errors.New("invalid credentials")
 	}
-	return gatewayTestSession{}, nil
+	return gatewayTestAuthSession{}, nil
 }
 
 type httpTestShares struct {
-	permission apiv1alpha1.AgentInstanceSharePermission
-	instanceID string
-	err        error
-	digest     []byte
+	sessionID string
+	err       error
+	digest    []byte
 }
 
-func (s *httpTestShares) GetAgentInstanceShareByTokenHash(_ context.Context, digest []byte) (*apiv1alpha1.AgentInstanceShare, string, error) {
+func (s *httpTestShares) GetSessionShareByTokenHash(_ context.Context, digest []byte) (*apiv1.SessionShare, string, error) {
 	s.digest = digest
-	return &apiv1alpha1.AgentInstanceShare{AgentInstanceId: s.instanceID, Permission: s.permission}, "owner", s.err
+	return &apiv1.SessionShare{SessionId: s.sessionID}, "owner", s.err
 }
 
 func newHTTPTestServer(t *testing.T, store *gatewayTestStore, authorizer auth.Authorizer, shares *httpTestShares) (*httptest.Server, *gatewayTestRuntime) {
@@ -60,7 +60,7 @@ func newHTTPTestServer(t *testing.T, store *gatewayTestStore, authorizer auth.Au
 	server := httptest.NewUnstartedServer(nil)
 	store.task = &a2atype.Task{ID: "runtime-task", ContextID: gatewayTestContextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}
 	runtime := &gatewayTestRuntime{task: store.task}
-	gateway := New(store, authorizer, &gatewayTestDialer{client: gatewayTestClient(t, runtime)}, "http://"+server.Listener.Addr().String()+"/")
+	gateway := newTestGateway(store, authorizer, &gatewayTestDialer{client: gatewayTestClient(t, runtime)}, "http://"+server.Listener.Addr().String()+"/")
 	server.Config.Handler = NewHTTPHandler(gateway, httpTestAuthenticator{}, shares)
 	server.Start()
 	t.Cleanup(server.Close)
@@ -74,9 +74,168 @@ func httpTestContext(t *testing.T) context.Context {
 	return a2aclient.AttachServiceParams(ctx, a2aclient.ServiceParams{"authorization": {"Bearer valid"}})
 }
 
+func newGatewayTestTransport(t *testing.T, address string, protocol a2atype.TransportProtocol) a2aclient.Transport {
+	t.Helper()
+	var transport a2aclient.Transport
+	if protocol == a2atype.TransportProtocolGRPC {
+		connection, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err)
+		transport = a2agrpc.NewGRPCTransport(connection)
+	} else {
+		httpClient := &http.Client{Transport: &http.Transport{}}
+		t.Cleanup(httpClient.CloseIdleConnections)
+		transport = a2aclient.NewJSONRPCTransport("http://"+address+HTTPPathPrefix+gatewayTestAgent, httpClient)
+	}
+	t.Cleanup(func() { require.NoError(t, transport.Destroy()) })
+	return transport
+}
+
+func TestGatewayCreatesConversationAndReusesInitialMessage(t *testing.T) {
+	for _, protocol := range []a2atype.TransportProtocol{a2atype.TransportProtocolJSONRPC, a2atype.TransportProtocolGRPC} {
+		t.Run(string(protocol), func(t *testing.T) {
+			store := &gatewayTestStore{created: map[string]*apiv1.Session{}}
+			runtime := &gatewayTestRuntime{}
+			authorizer := &gatewayTestAuthorizer{}
+			gateway := newTestGateway(store, authorizer, &gatewayTestDialer{client: gatewayTestClient(t, runtime)}, "")
+			transport := newGatewayTestTransport(t, startCoreTestServer(t, gateway, nil), protocol)
+			tenant := ""
+			if protocol == a2atype.TransportProtocolGRPC {
+				tenant = gatewayTestAgent
+			}
+			params := a2aclient.ServiceParams{"authorization": {"Bearer valid"}}
+			request := func(id string) *a2atype.SendMessageRequest {
+				message := a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("hello"))
+				message.ID = id
+				return &a2atype.SendMessageRequest{Tenant: tenant, Message: message, Config: &a2atype.SendMessageConfig{ReturnImmediately: true}}
+			}
+			first, err := transport.SendMessage(t.Context(), params, request("first"))
+			require.NoError(t, err)
+			task := first.(*a2atype.Task)
+			require.Equal(t, store.session.Id, task.ContextID)
+			require.Equal(t, "first", store.initialID)
+			store.reserveErr, store.replay, store.task = database.ErrMessageAccepted, task, task
+			retry, err := transport.SendMessage(t.Context(), params, request("first"))
+			require.NoError(t, err)
+			require.Equal(t, first, retry)
+			require.Equal(t, 1, runtime.sendCalls)
+			require.Len(t, store.created, 1)
+			// Task-only requests must resolve the same Session without a context ID.
+			persisted, err := transport.GetTask(t.Context(), params, &a2atype.GetTaskRequest{Tenant: tenant, ID: task.ID})
+			require.NoError(t, err)
+			require.Equal(t, task, persisted)
+			listed, err := transport.ListTasks(t.Context(), params, &a2atype.ListTasksRequest{Tenant: tenant, ContextID: task.ContextID})
+			require.NoError(t, err)
+			require.Equal(t, []string{string(task.ContextID)}, store.listedIDs)
+			require.NotNil(t, listed)
+			store.reserveErr = nil
+			second, err := transport.SendMessage(t.Context(), params, request("second"))
+			require.NoError(t, err)
+			require.NotEqual(t, task.ContextID, second.(*a2atype.Task).ContextID)
+			require.Len(t, store.created, 2)
+		})
+	}
+}
+
+func TestGatewayMissingConversationAcrossTransports(t *testing.T) {
+	for _, protocol := range []a2atype.TransportProtocol{a2atype.TransportProtocolJSONRPC, a2atype.TransportProtocolGRPC} {
+		for _, test := range []struct {
+			name     string
+			storeErr error
+			taskErr  error
+			authErr  error
+			want     error
+		}{
+			{name: "missing context", storeErr: database.ErrNotFound, want: a2atype.ErrTaskNotFound},
+			{name: "expired task", taskErr: database.ErrNotFound, storeErr: database.ErrNotFound, want: a2atype.ErrTaskNotFound},
+			{name: "permission denied", authErr: errors.New("denied"), want: a2atype.ErrUnauthorized},
+			{name: "store failure", storeErr: errors.New("private database details"), want: a2atype.ErrInternalError},
+		} {
+			t.Run(string(protocol)+"/"+test.name, func(t *testing.T) {
+				store := &gatewayTestStore{session: gatewayTestSession(), err: test.storeErr, taskErr: test.taskErr}
+				dialer := &gatewayTestDialer{}
+				gateway := newTestGateway(store, &gatewayTestAuthorizer{err: test.authErr}, dialer, "")
+				transport := newGatewayTestTransport(t, startCoreTestServer(t, gateway, nil), protocol)
+				params := a2aclient.ServiceParams{"authorization": {"Bearer valid"}}
+				for _, ids := range []struct {
+					contextID string
+					taskID    a2atype.TaskID
+				}{
+					{contextID: gatewayTestID},
+					{taskID: "old-task"},
+					{}, // A new conversation must first resolve the Agent.
+				} {
+					request := gatewayTestRequest()
+					request.Message.ContextID, request.Message.TaskID = ids.contextID, ids.taskID
+					_, err := transport.SendMessage(t.Context(), params, request)
+					require.ErrorIs(t, err, test.want)
+					events := 0
+					for event, err := range transport.SendStreamingMessage(t.Context(), params, request) {
+						require.Nil(t, event)
+						require.ErrorIs(t, err, test.want)
+						events++
+					}
+					require.Equal(t, 1, events)
+				}
+				_, err := transport.GetTask(t.Context(), params, &a2atype.GetTaskRequest{Tenant: gatewayTestAgent, ID: "old-task"})
+				require.ErrorIs(t, err, test.want)
+				_, err = transport.GetExtendedAgentCard(t.Context(), params, &a2atype.GetExtendedAgentCardRequest{Tenant: gatewayTestAgent})
+				require.ErrorIs(t, err, test.want)
+				events := 0
+				for event, err := range transport.SubscribeToTask(t.Context(), params, &a2atype.SubscribeToTaskRequest{Tenant: gatewayTestAgent, ID: "old-task"}) {
+					require.Nil(t, event)
+					require.ErrorIs(t, err, test.want)
+					events++
+				}
+				require.Equal(t, 1, events)
+				require.Nil(t, dialer.session, "unavailable conversations must not reach the runtime")
+				require.Zero(t, store.reserveCalls)
+				require.False(t, store.unscoped, "session lookup must retain ownership filtering")
+			})
+		}
+	}
+}
+
+func TestHTTPAgentURLIsAuthoritative(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, tenant string
+		want               error
+	}{
+		{name: "URL only", path: gatewayTestAgent},
+		{name: "trailing slash", path: gatewayTestAgent + "/"},
+		{name: "matching tenant", path: gatewayTestAgent, tenant: gatewayTestAgent},
+		{name: "conflicting tenant", path: gatewayTestAgent, tenant: "team-a/other", want: a2atype.ErrInvalidRequest},
+		{name: "invalid URL", path: "INVALID/assistant", want: a2atype.ErrInvalidRequest},
+		{name: "Session belongs to another Agent", path: "team-a/other", want: a2atype.ErrUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &gatewayTestStore{session: gatewayTestSession()}
+			server, runtime := newHTTPTestServer(t, store, &gatewayTestAuthorizer{}, nil)
+			transport := a2aclient.NewJSONRPCTransport(server.URL+HTTPPathPrefix+tc.path, server.Client())
+			t.Cleanup(func() { require.NoError(t, transport.Destroy()) })
+			params := a2aclient.ServiceParams{"authorization": {"Bearer valid"}}
+			request := gatewayTestRequest()
+			request.Tenant = tc.tenant
+			_, err := transport.SendMessage(t.Context(), params, request)
+			require.ErrorIs(t, err, tc.want)
+			events := 0
+			for _, err := range transport.SendStreamingMessage(t.Context(), params, request) {
+				require.ErrorIs(t, err, tc.want)
+				events++
+			}
+			require.Positive(t, events)
+			_, err = transport.GetTask(t.Context(), params, &a2atype.GetTaskRequest{Tenant: tc.tenant, ID: store.task.ID})
+			require.ErrorIs(t, err, tc.want)
+			if tc.want != nil {
+				require.False(t, runtime.sent)
+				require.Empty(t, store.stored)
+			}
+		})
+	}
+}
+
 func TestHTTPAgentCardDiscoveryAndRouting(t *testing.T) {
 	store := &gatewayTestStore{
-		instance: gatewayTestInstance(),
+		session: gatewayTestSession(),
 		revision: &database.RuntimeRevision{AgentCard: &a2apb.AgentCard{
 			Name: "assistant", Description: "pinned description", Version: "1",
 			SupportedInterfaces: []*a2apb.AgentInterface{{Url: "http://private-runtime", ProtocolBinding: "GRPC", ProtocolVersion: "1.0"}},
@@ -85,12 +244,12 @@ func TestHTTPAgentCardDiscoveryAndRouting(t *testing.T) {
 		}},
 	}
 	server, _ := newHTTPTestServer(t, store, &gatewayTestAuthorizer{}, nil)
-	endpoint := server.URL + HTTPPathPrefix + gatewayTestID
+	endpoint := server.URL + HTTPPathPrefix + gatewayTestAgent
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, endpoint+a2asrv.WellKnownAgentCardPath, nil)
 	require.NoError(t, err)
 	request.Header.Set("Authorization", "Bearer valid")
 	// A conflicting header must never change the URL's authority.
-	request.Header.Set(apia2a.AgentInstanceIDHeader, "12345678-1234-4234-8234-123456789abc")
+	request.Header.Set("x-kagent-session-id", "12345678-1234-4234-8234-123456789abc")
 	response, err := server.Client().Do(request)
 	require.NoError(t, err)
 	defer response.Body.Close()
@@ -100,12 +259,15 @@ func TestHTTPAgentCardDiscoveryAndRouting(t *testing.T) {
 	var card a2atype.AgentCard
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&card))
 	require.Equal(t, "pinned description", card.Description)
-	require.Equal(t, gatewayTestID, store.id)
-	require.Equal(t, "alice", store.userID)
+	require.Empty(t, store.id, "card discovery must not require a conversation")
+	require.Empty(t, store.userID)
 	require.Len(t, card.SupportedInterfaces, 2)
 	require.Equal(t, endpoint, card.SupportedInterfaces[0].URL)
 	require.Equal(t, a2atype.TransportProtocolJSONRPC, card.SupportedInterfaces[0].ProtocolBinding)
+	require.Empty(t, card.SupportedInterfaces[0].Tenant)
 	require.Equal(t, a2atype.TransportProtocolGRPC, card.SupportedInterfaces[1].ProtocolBinding)
+	require.Equal(t, gatewayTestAgent, card.SupportedInterfaces[1].Tenant)
+	require.True(t, card.Capabilities.PushNotifications)
 	require.Len(t, card.Capabilities.Extensions, 1)
 
 	// A standard SDK client can use the discovered URL without a routing header.
@@ -115,7 +277,9 @@ func TestHTTPAgentCardDiscoveryAndRouting(t *testing.T) {
 	extended, err := client.GetExtendedAgentCard(httpTestContext(t), &a2atype.GetExtendedAgentCardRequest{})
 	require.NoError(t, err)
 	require.Equal(t, &card, extended)
-	result, err := client.SendMessage(httpTestContext(t), gatewayTestRequest())
+	message := gatewayTestRequest()
+	message.Tenant = ""
+	result, err := client.SendMessage(httpTestContext(t), message)
 	require.NoError(t, err)
 	task, ok := result.(*a2atype.Task)
 	require.True(t, ok)
@@ -123,8 +287,8 @@ func TestHTTPAgentCardDiscoveryAndRouting(t *testing.T) {
 	require.Equal(t, gatewayTestContextID, task.ContextID)
 	// JSON-RPC also uses the URL when callers supply conflicting routing headers.
 	ctx := a2aclient.AttachServiceParams(httpTestContext(t), a2aclient.ServiceParams{
-		"authorization":              {"Bearer valid"},
-		apia2a.AgentInstanceIDHeader: {"12345678-1234-4234-8234-123456789abc", "invalid"},
+		"authorization":       {"Bearer valid"},
+		"x-kagent-session-id": {"12345678-1234-4234-8234-123456789abc", "invalid"},
 	})
 	persisted, err := client.GetTask(ctx, &a2atype.GetTaskRequest{ID: task.ID})
 	require.NoError(t, err)
@@ -133,17 +297,19 @@ func TestHTTPAgentCardDiscoveryAndRouting(t *testing.T) {
 }
 
 func TestHTTPGatewayStreamingAndCancellation(t *testing.T) {
-	store := &gatewayTestStore{instance: gatewayTestInstance()}
+	store := &gatewayTestStore{session: gatewayTestSession()}
 	server, runtime := newHTTPTestServer(t, store, &gatewayTestAuthorizer{}, nil)
 	client, err := a2aclient.NewFromEndpoints(t.Context(), []*a2atype.AgentInterface{
-		a2atype.NewAgentInterface(server.URL+HTTPPathPrefix+gatewayTestID, a2atype.TransportProtocolJSONRPC),
+		a2atype.NewAgentInterface(server.URL+HTTPPathPrefix+gatewayTestAgent, a2atype.TransportProtocolJSONRPC),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Destroy()) })
 	ctx := httpTestContext(t)
 	var taskID a2atype.TaskID
 	var completed bool
-	for event, err := range client.SendStreamingMessage(ctx, gatewayTestRequest()) {
+	message := gatewayTestRequest()
+	message.Tenant = ""
+	for event, err := range client.SendStreamingMessage(ctx, message) {
 		require.NoError(t, err)
 		taskID = event.TaskInfo().TaskID
 		if task, ok := event.(*a2atype.Task); ok && task.Status.State == a2atype.TaskStateCompleted {
@@ -188,18 +354,18 @@ func TestHTTPGatewayRejectsInvalidAccess(t *testing.T) {
 		authzErr   error
 		want       int
 	}{
-		{name: "card needs authentication", method: "GET", path: gatewayTestID + a2asrv.WellKnownAgentCardPath, want: 401},
-		{name: "RPC needs authentication", method: "POST", path: gatewayTestID, want: 401},
-		{name: "card needs authorization", method: "GET", path: gatewayTestID + a2asrv.WellKnownAgentCardPath, authorized: true, authzErr: errors.New("denied"), want: 403},
-		{name: "missing instance is hidden", method: "GET", path: gatewayTestID + a2asrv.WellKnownAgentCardPath, authorized: true, storeErr: database.ErrNotFound, want: 403},
-		{name: "internal errors are hidden", method: "GET", path: gatewayTestID + a2asrv.WellKnownAgentCardPath, authorized: true, storeErr: errors.New("private connection details"), want: 500},
-		{name: "invalid instance ID", method: "GET", path: "invalid" + a2asrv.WellKnownAgentCardPath, authorized: true, want: 400},
-		{name: "unknown route", method: "GET", path: gatewayTestID + "/unknown", authorized: true, want: 404},
-		{name: "card only supports reads", method: "POST", path: gatewayTestID + a2asrv.WellKnownAgentCardPath, authorized: true, want: 405},
+		{name: "card needs authentication", method: "GET", path: gatewayTestAgent + a2asrv.WellKnownAgentCardPath, want: 401},
+		{name: "RPC needs authentication", method: "POST", path: gatewayTestAgent, want: 401},
+		{name: "card needs authorization", method: "GET", path: gatewayTestAgent + a2asrv.WellKnownAgentCardPath, authorized: true, authzErr: errors.New("denied"), want: 403},
+		{name: "missing Agent", method: "GET", path: gatewayTestAgent + a2asrv.WellKnownAgentCardPath, authorized: true, storeErr: database.ErrNotFound, want: 404},
+		{name: "internal errors are hidden", method: "GET", path: gatewayTestAgent + a2asrv.WellKnownAgentCardPath, authorized: true, storeErr: errors.New("private connection details"), want: 500},
+		{name: "invalid session ID", method: "GET", path: "invalid!/assistant" + a2asrv.WellKnownAgentCardPath, authorized: true, want: 400},
+		{name: "unknown route", method: "GET", path: gatewayTestAgent + "/unknown", authorized: true, want: 404},
+		{name: "card only supports reads", method: "POST", path: gatewayTestAgent + a2asrv.WellKnownAgentCardPath, authorized: true, want: 405},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store := &gatewayTestStore{instance: gatewayTestInstance(), err: test.storeErr}
-			handler := NewHTTPHandler(New(store, &gatewayTestAuthorizer{err: test.authzErr}, nil, gatewayTestURL), httpTestAuthenticator{}, nil)
+			store := &gatewayTestStore{session: gatewayTestSession(), err: test.storeErr}
+			handler := NewHTTPHandler(newTestGateway(store, &gatewayTestAuthorizer{err: test.authzErr}, nil, gatewayTestURL), httpTestAuthenticator{}, nil)
 			request := httptest.NewRequest(test.method, HTTPPathPrefix+test.path, nil)
 			if test.authorized {
 				request.Header.Set("Authorization", "Bearer valid")
@@ -212,73 +378,66 @@ func TestHTTPGatewayRejectsInvalidAccess(t *testing.T) {
 	}
 }
 
-func TestGatewaySharePermissionsAcrossTransports(t *testing.T) {
+func TestGatewayReadOnlySharesAcrossTransports(t *testing.T) {
 	for _, protocol := range []a2atype.TransportProtocol{a2atype.TransportProtocolJSONRPC, a2atype.TransportProtocolGRPC} {
 		t.Run(string(protocol), func(t *testing.T) {
 			for _, test := range []struct {
 				name       string
-				permission apiv1alpha1.AgentInstanceSharePermission
-				instanceID string
+				sessionID  string
 				storeErr   error
 				wantStatus int
 				canRead    bool
-				canWrite   bool
+				denied     bool
 			}{
-				{name: "read only", permission: apiv1alpha1.AgentInstanceSharePermission_AGENT_INSTANCE_SHARE_PERMISSION_READ_ONLY, instanceID: gatewayTestID, canRead: true},
-				{name: "read write", permission: apiv1alpha1.AgentInstanceSharePermission_AGENT_INSTANCE_SHARE_PERMISSION_READ_WRITE, instanceID: gatewayTestID, canRead: true, canWrite: true},
-				{name: "other instance", instanceID: "12345678-1234-4234-8234-123456789abc"},
+				{name: "read only", sessionID: gatewayTestID, canRead: true},
+				{name: "policy denied", sessionID: gatewayTestID, denied: true},
+				{name: "other session", sessionID: "12345678-1234-4234-8234-123456789abc"},
 				{name: "expired", storeErr: database.ErrNotFound, wantStatus: 403},
 				{name: "store unavailable", storeErr: errors.New("database credentials"), wantStatus: 500},
 			} {
 				t.Run(test.name, func(t *testing.T) {
-					store := &gatewayTestStore{instance: gatewayTestInstance(), task: &a2atype.Task{ID: "task", ContextID: gatewayTestContextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}}
-					shares := &httpTestShares{permission: test.permission, instanceID: test.instanceID, err: test.storeErr}
+					store := &gatewayTestStore{session: gatewayTestSession(), task: &a2atype.Task{ID: "task", ContextID: gatewayTestContextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}}
+					shares := &httpTestShares{sessionID: test.sessionID, err: test.storeErr}
 					runtime := &gatewayTestRuntime{cancelErr: a2atype.ErrTaskNotFound}
-					gateway := New(store, &gatewayDenyAuthorizer{}, &gatewayTestDialer{client: gatewayTestClient(t, runtime)}, gatewayTestURL)
-					address := startCoreTestServer(t, gateway, shares)
-					var transport a2aclient.Transport
-					params := a2aclient.ServiceParams{"authorization": {"Bearer valid"}, "x-share-token": {"share"}}
-					if protocol == a2atype.TransportProtocolGRPC {
-						connection, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
-						require.NoError(t, err)
-						transport = a2agrpc.NewGRPCTransport(connection)
-						params[apia2a.AgentInstanceIDHeader] = []string{gatewayTestID}
-					} else {
-						httpClient := &http.Client{Transport: &http.Transport{}}
-						t.Cleanup(httpClient.CloseIdleConnections)
-						transport = a2aclient.NewJSONRPCTransport("http://"+address+HTTPPathPrefix+gatewayTestID, httpClient)
+					authorizer := &gatewayTestAuthorizer{}
+					if test.denied {
+						authorizer.err = errors.New("denied")
 					}
-					t.Cleanup(func() { require.NoError(t, transport.Destroy()) })
-					_, err := transport.GetTask(t.Context(), params, &a2atype.GetTaskRequest{ID: "task"})
+					gateway := newTestGateway(store, authorizer, &gatewayTestDialer{client: gatewayTestClient(t, runtime)}, gatewayTestURL)
+					address := startCoreTestServer(t, gateway, shares)
+					transport := newGatewayTestTransport(t, address, protocol)
+					params := a2aclient.ServiceParams{"authorization": {"Bearer valid"}, "x-share-token": {"share"}}
+					_, err := transport.GetTask(t.Context(), params, &a2atype.GetTaskRequest{Tenant: gatewayTestAgent, ID: "task"})
 					if test.canRead {
 						require.NoError(t, err)
 						require.Equal(t, "owner", store.userID)
 					} else {
 						require.Error(t, err)
 					}
+					subscriptionEvents := 0
+					for _, err := range transport.SubscribeToTask(t.Context(), params, &a2atype.SubscribeToTaskRequest{Tenant: gatewayTestAgent, ID: "task"}) {
+						subscriptionEvents++
+						if test.canRead {
+							require.NoError(t, err)
+						} else {
+							require.Error(t, err)
+						}
+					}
+					require.Equal(t, 1, subscriptionEvents)
 					digest := sha256.Sum256([]byte("share"))
 					require.Equal(t, digest[:], shares.digest)
-					_, err = transport.CancelTask(t.Context(), params, &a2atype.CancelTaskRequest{ID: "task"})
-					if test.canWrite {
-						require.NoError(t, err)
-					} else {
-						require.Error(t, err)
-					}
+					_, err = transport.CancelTask(t.Context(), params, &a2atype.CancelTaskRequest{Tenant: gatewayTestAgent, ID: "task"})
+					require.Error(t, err)
 					_, err = transport.SendMessage(t.Context(), params, gatewayTestRequest())
-					if test.canWrite {
-						require.NoError(t, err)
-					} else {
+					require.Error(t, err)
+					errorsSeen := 0
+					for _, err := range transport.SendStreamingMessage(t.Context(), params, gatewayTestRequest()) {
 						require.Error(t, err)
+						errorsSeen++
 					}
-					if !test.canWrite {
-						errorsSeen := 0
-						for _, err := range transport.SendStreamingMessage(t.Context(), params, gatewayTestRequest()) {
-							require.Error(t, err)
-							errorsSeen++
-						}
-						require.Equal(t, 1, errorsSeen)
-						require.Empty(t, store.stored)
-					}
+					require.Equal(t, 1, errorsSeen)
+					require.Empty(t, store.stored)
+					require.False(t, runtime.sent)
 					if test.wantStatus != 0 && protocol == a2atype.TransportProtocolJSONRPC {
 						require.Contains(t, err.Error(), http.StatusText(test.wantStatus))
 					}
@@ -290,8 +449,8 @@ func TestGatewaySharePermissionsAcrossTransports(t *testing.T) {
 
 func TestHTTPGatewayMalformedJSONRPC(t *testing.T) {
 	store := &gatewayTestStore{}
-	handler := NewHTTPHandler(New(store, &gatewayTestAuthorizer{}, nil, gatewayTestURL), httpTestAuthenticator{}, nil)
-	request := httptest.NewRequest(http.MethodPost, HTTPPathPrefix+gatewayTestID, strings.NewReader(`{"jsonrpc":`))
+	handler := NewHTTPHandler(newTestGateway(store, &gatewayTestAuthorizer{}, nil, gatewayTestURL), httpTestAuthenticator{}, nil)
+	request := httptest.NewRequest(http.MethodPost, HTTPPathPrefix+gatewayTestAgent, strings.NewReader(`{"jsonrpc":`))
 	request.Header.Set("Authorization", "Bearer valid")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -300,7 +459,7 @@ func TestHTTPGatewayMalformedJSONRPC(t *testing.T) {
 	require.Empty(t, store.id)
 }
 
-func startCoreTestServer(t *testing.T, gateway a2asrv.RequestHandler, shares agentinstance.ShareStore) string {
+func startCoreTestServer(t *testing.T, gateway a2asrv.RequestHandler, shares sessionsvc.ShareStore) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -325,4 +484,106 @@ func startCoreTestServer(t *testing.T, gateway a2asrv.RequestHandler, shares age
 	})
 
 	return listener.Addr().String()
+}
+
+func TestEmbeddedPushAcrossTransports(t *testing.T) {
+	for _, protocol := range []a2atype.TransportProtocol{a2atype.TransportProtocolJSONRPC, a2atype.TransportProtocolGRPC} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", protocol, streaming), func(t *testing.T) {
+				store := &gatewayTestStore{created: map[string]*apiv1.Session{}}
+				runtime := &gatewayTestRuntime{}
+				runtime.onStream = func(req *a2atype.SendMessageRequest) {
+					store.task = &a2atype.Task{ID: "runtime-task", ContextID: req.Message.ContextID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}
+				}
+				gateway := newTestGateway(store, &gatewayTestAuthorizer{}, &gatewayTestDialer{client: gatewayTestClient(t, runtime)}, "")
+				transport := newGatewayTestTransport(t, startCoreTestServer(t, gateway, nil), protocol)
+				params := a2aclient.ServiceParams{"authorization": {"Bearer valid"}}
+				tenant := ""
+				if protocol == a2atype.TransportProtocolGRPC {
+					tenant = gatewayTestAgent
+				}
+				request := func() *a2atype.SendMessageRequest {
+					return &a2atype.SendMessageRequest{Tenant: tenant, Message: &a2atype.Message{ID: "initial", Role: a2atype.MessageRoleUser, Parts: a2atype.ContentParts{a2atype.NewTextPart("hello")}}, Config: &a2atype.SendMessageConfig{ReturnImmediately: true, HistoryLength: new(0), PushConfig: &a2atype.PushConfig{URL: "https://receiver", Tenant: gatewayTestAgent}}}
+				}
+				send := func() error {
+					if streaming {
+						// Drain the response so deferred dispatch cleanup finishes before
+						// the next request reads or changes the shared test doubles.
+						for _, err := range transport.SendStreamingMessage(t.Context(), params, request()) {
+							if err != nil {
+								return err
+							}
+						}
+						return nil
+					}
+					_, err := transport.SendMessage(t.Context(), params, request())
+					return err
+				}
+				require.NoError(t, send())
+				require.NotNil(t, store.pushConfig)
+				require.NotEmpty(t, store.pushConfig.ID)
+				configID := store.pushConfig.ID
+				require.Equal(t, store.session.Id, store.pushSessionID)
+				require.Equal(t, "initial", store.pushMessageID)
+				require.NotNil(t, runtime.sentConfig)
+				require.Nil(t, runtime.sentConfig.PushConfig)
+				require.True(t, runtime.sentConfig.ReturnImmediately)
+				require.Equal(t, 0, *runtime.sentConfig.HistoryLength)
+				// Already accepted input still registers, without dispatching again.
+				store.reserveErr = database.ErrMessageAccepted
+				store.task = &a2atype.Task{ID: "accepted", ContextID: store.session.Id, Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}
+				store.replay = store.task
+				runtime.sentConfig, store.pushConfig = nil, nil
+				require.NoError(t, send())
+				require.NotNil(t, store.pushConfig)
+				require.Equal(t, configID, store.pushConfig.ID)
+				require.Nil(t, runtime.sentConfig)
+				// Persistence failure prevents both reservation and forwarding.
+				store.pushErr = database.ErrIdempotencyConflict
+				reservations := store.reserveCalls
+				require.Error(t, send())
+				require.Equal(t, reservations, store.reserveCalls)
+				require.Nil(t, runtime.sentConfig)
+			})
+		}
+	}
+}
+
+// Session creation is permitted, so only the independent target Agent check can
+// reject this first message. No Session or dispatch may be reserved on denial.
+type denyAgentGetPolicy struct {
+	agents []auth.Resource
+}
+
+func (d *denyAgentGetPolicy) Check(_ context.Context, _ auth.Principal, verb auth.Verb, resource auth.Resource) error {
+	if verb == auth.VerbGet && resource.Type == "Agent" {
+		d.agents = append(d.agents, resource)
+		return errors.New("target Agent access denied")
+	}
+	return nil
+}
+
+func TestGatewayNewConversationRequiresAgentAccessAcrossTransports(t *testing.T) {
+	for _, protocol := range []a2atype.TransportProtocol{a2atype.TransportProtocolJSONRPC, a2atype.TransportProtocolGRPC} {
+		t.Run(string(protocol), func(t *testing.T) {
+			store := &gatewayTestStore{created: map[string]*apiv1.Session{}}
+			policy := &denyAgentGetPolicy{}
+			dialer := &gatewayTestDialer{}
+			gateway := newTestGateway(store, policy, dialer, "")
+			transport := newGatewayTestTransport(t, startCoreTestServer(t, gateway, nil), protocol)
+			tenant := ""
+			if protocol == a2atype.TransportProtocolGRPC {
+				tenant = gatewayTestAgent
+			}
+			_, err := transport.SendMessage(t.Context(), a2aclient.ServiceParams{"authorization": {"Bearer valid"}}, &a2atype.SendMessageRequest{
+				Tenant:  tenant,
+				Message: a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("hello")),
+			})
+			require.ErrorIs(t, err, a2atype.ErrUnauthorized)
+			require.Equal(t, []auth.Resource{{Type: "Agent", Namespace: "team-a", Name: "assistant"}}, policy.agents)
+			require.Empty(t, store.created)
+			require.Zero(t, store.reserveCalls)
+			require.Nil(t, dialer.session)
+		})
+	}
 }

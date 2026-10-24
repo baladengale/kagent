@@ -1,0 +1,16 @@
+package commands
+
+import (
+	"github.com/spf13/cobra"
+
+	"github.com/kagent-dev/kagent/go/core/cli/internal/commands/session"
+)
+
+// NewAgentCmd groups agent discovery, invocation, and conversations.
+func NewAgentCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "agent", Short: "Discover agents and work with their conversations"}
+	templates := &cobra.Command{Use: "template", Short: "Discover reusable agent templates"}
+	templates.AddCommand(newAgentTemplateReadCmd(true), newAgentTemplateReadCmd(false))
+	cmd.AddCommand(newAgentReadCmd(true), newAgentReadCmd(false), session.NewInvokeCmd(), session.NewCmd(), templates)
+	return cmd
+}

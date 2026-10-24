@@ -7,9 +7,10 @@ import (
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	adkagent "google.golang.org/adk/v2/agent"
+
 	"github.com/kagent-dev/kagent/go/adk/pkg/a2a"
 	apia2a "github.com/kagent-dev/kagent/go/api/a2a"
-	adkagent "google.golang.org/adk/v2/agent"
 )
 
 // newReq returns an empty outbound client Request with initialized service params.
@@ -129,35 +130,25 @@ func assertSingleHeader(t *testing.T, req *a2aclient.Request, key, want string) 
 	}
 }
 
-// TestContextIDForCall_IsolateSessions covers the EP#2137 fix: isolated tools
-// mint a fresh context_id per call so parallel/serial calls to the same
-// sub-agent land in independent sessions, while non-isolated tools keep
-// reusing one context_id for session continuity.
+// Isolated calls request a new server-assigned conversation; shared calls use
+// the context returned by their first response.
 func TestContextIDForCall_IsolateSessions(t *testing.T) {
-	t.Run("isolated: each call gets a distinct, non-empty context_id", func(t *testing.T) {
-		s := &remoteA2AState{isolateSessions: true, sharedContextID: "stable-id"}
-
-		first := s.contextIDForCall()
-		second := s.contextIDForCall()
-
-		if first == "" || second == "" {
-			t.Fatalf("expected non-empty context ids, got %q and %q", first, second)
-		}
-		if first == second {
-			t.Errorf("expected distinct context ids for isolated calls, got the same id %q twice", first)
-		}
-	})
-
-	t.Run("not isolated: every call reuses the stable sharedContextID", func(t *testing.T) {
-		s := &remoteA2AState{isolateSessions: false, sharedContextID: "stable-id"}
-
-		first := s.contextIDForCall()
-		second := s.contextIDForCall()
-
-		if first != "stable-id" || second != "stable-id" {
-			t.Errorf("expected both calls to reuse sharedContextID %q, got %q and %q", "stable-id", first, second)
-		}
-	})
+	for _, tc := range []struct {
+		name           string
+		isolated       bool
+		existing, want string
+	}{
+		{"first call", false, "", ""},
+		{"shared continuation", false, "server-context", "server-context"},
+		{"isolated", true, "server-context", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &remoteA2AState{isolateSessions: tc.isolated, sharedContextID: tc.existing}
+			if got := s.contextIDForCall(); got != tc.want {
+				t.Fatalf("context = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestProcessResult_SetsSubagentSessionIDOnEveryBranch covers the review

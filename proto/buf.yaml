@@ -10,7 +10,17 @@ lint:
   ignore:
     - a2a.proto
     - ateapi.proto
+    - ateenv/v1alpha/guest.proto
 breaking:
   use:
     - FILE
+  # Pre-release memory cleanup removes reservations for obsolete identity fields.
+  # Remove this exception once the cleanup is present on the comparison branch.
+  ignore_only:
+    RESERVED_MESSAGE_NO_DELETE:
+      - kagent/runtime/v1/memory.proto
+  # Vendored upstream alpha API; upgrades follow go.mod. Kagent does not expose
+  # its egress policy types, which changed incompatibly in alpha3.
+  ignore:
+    - ateapi.proto
   ignore_unstable_packages: true

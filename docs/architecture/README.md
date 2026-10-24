@@ -1,7 +1,8 @@
 # Architecture
 
 Kagent is a Kubernetes-native control plane for defining, compiling, running,
-and invoking agents. Kubernetes stores desired agent configuration. PostgreSQL
+and invoking agents, with standalone sandboxes for command and file work.
+Kubernetes stores desired agent and sandbox configuration. PostgreSQL
 stores runtime identity, A2A history, and lifecycle state. Substrate Actors run
 the agent processes.
 
@@ -9,60 +10,86 @@ the agent processes.
 
 | Resource                      | Owner                                    | Purpose                                                                       |
 | ----------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------- |
-| `Harness`                     | Kubernetes (`kagent.dev/v1alpha3`)       | Runtime implementation, workload, credentials, capacity, and admission policy |
-| `AgentTemplate`               | Kubernetes (`kagent.dev/v1alpha3`)       | Portable agent behavior: model, prompt, tools, skills, and plugins            |
+| `Agent` | Kubernetes (`api.kagent.dev/v1alpha3`) | Inline-or-reference behavior paired with a referenced Harness, readiness, and revision selection |
+| `Harness`                     | Kubernetes (`api.kagent.dev/v1alpha3`)       | Runtime implementation, workload, credentials, capacity, and snapshot policy |
+| `AgentTemplate`               | Kubernetes (`api.kagent.dev/v1alpha3`)       | Portable agent behavior: model, prompt, tools, skills, and plugins            |
+| `SandboxTemplate` | Kubernetes (`api.kagent.dev/v1alpha3`) | Tools image, environment, and preparation policy for standalone sandboxes |
+| `EgressPolicy` | Kubernetes (`api.kagent.dev/v1alpha3`) | Additional HTTP(S) origins and gateway credentials selected by Agents and SandboxTemplates |
 | prepared revision             | PostgreSQL and ate-api                   | Immutable compiled runtime input and its Substrate ActorTemplate              |
-| `AgentInstance`               | PostgreSQL, exposed by gRPC              | Ephemeral compute identity and lifecycle                                      |
+| `Session`               | PostgreSQL, exposed by gRPC              | Stable conversation identity and runtime lifecycle                                      |
+| `Sandbox` | PostgreSQL, exposed by gRPC and MCP | Owner-scoped scratch environment with process/file access and expiration |
 | A2A context, task, and events | PostgreSQL, exposed by A2A               | Durable interaction and audit history                                         |
 | checkpoint                    | PostgreSQL plus a Substrate snapshot tag | Immutable, named restart boundary                                             |
 | Actor and durable directory   | Substrate                                | Process lifecycle and private runtime state                                   |
 
-`AgentInstance` is not a Kubernetes resource. A2A owns public interaction
+`Session` is not a Kubernetes resource. A2A owns public interaction
 semantics; kagent does not maintain a parallel session or task API.
 
 ## Public surfaces
 
 | Surface         | Role                                                                        |
 | --------------- | --------------------------------------------------------------------------- |
-| Kubernetes API  | Author Harnesses, AgentTemplates, models, prompts, and remote MCP servers   |
-| gRPC / gRPC-Web | Manage AgentInstances, sharing, checkpoints, and control-plane reads        |
+| Kubernetes API  | Author Agents, Harnesses, AgentTemplates, SandboxTemplates, models, prompts, and remote MCP servers   |
+| gRPC / gRPC-Web | Manage Sessions, sharing, checkpoints, sandboxes, and control-plane reads        |
 | A2A             | Invoke agents and manage durable tasks and streams                          |
-| MCP             | Discover, invoke, checkpoint, and fork AgentInstances through A2A semantics |
+| MCP             | Discover, invoke, checkpoint, and fork Sessions; create and use standalone sandboxes |
+
+Public control-plane protobuf contracts use `kagent.api.v1` under
+[`proto/kagent/api/v1`](../../proto/kagent/api/v1). TaskStore and Memory contracts for
+agent runtimes use `kagent.runtime.v1` under
+[`proto/kagent/runtime/v1`](../../proto/kagent/runtime/v1). CLI, controller, and ADK
+configuration use `kagent.config.v1` under
+[`proto/kagent/config/v1`](../../proto/kagent/config/v1). All three use compatible
+field changes, deprecation, and reservation of removed field names and numbers. Kubernetes
+resources retain their separate API versions. See the
+[protobuf API conventions](../protobuf-api.md) for compatibility and generation rules.
+
+The public and runtime APIs share a gRPC listener and retain method-level authentication policies.
+TaskStore and Memory writes/search require verified actor authority. Memory
+list/delete accept users and actors, with service authorization and data ownership
+checks. Shared APIs use the same authentication provider and resource authorizer. The runtime namespace identifies its consumers, not an additional
+access restriction. Configuration messages are process inputs, with no RPC services.
+Browser bindings exclude runtime and configuration contracts.
 
 ## End-to-end flow
 
 ```mermaid
 flowchart LR
-    AT[AgentTemplate] --> R[resolve tree]
-    H[Harness] --> R
+    AGENT[Agent] --> AT[template: inline or ref]
+    AGENT --> H[harnessRef]
+    AT --> R[resolve tree]
+    H --> R
     R --> B[build harness inputs]
     B --> C[registered harness compiler]
     C --> REV[immutable revision]
     REV --> ATE[ate-api ActorTemplate]
     ATE --> SNAP[golden snapshot ready]
-    SNAP --> AI[AgentInstance]
+    SNAP --> AI[Session]
     AI --> ACTOR[Substrate Actor]
     CLIENT[A2A client] --> GW[public A2A gateway]
     GW --> ACTOR
     ACTOR --> STORE[private gRPC TaskStore]
     STORE --> DB[(tasks and events)]
-    DB --> QUIESCE[AgentInstance idle lifecycle]
+    DB --> QUIESCE[Session idle lifecycle]
     QUIESCE --> CKPT[checkpoint tag]
-    CKPT --> FORK[forked AgentInstance]
+    CKPT --> FORK[forked Session]
 ```
 
 Compilation and application are separate. The translator produces an immutable
 revision; the controller applies it through ate-api. At runtime, the public A2A
-gateway routes authorized callers to Actors through the private runtime network.
+gateway exposes each Agent and resolves context IDs to Sessions before routing
+authorized callers to Actors through the private runtime network.
 Runtimes persist A2A state through TaskStore and publish completion after native
-cleanup. AgentInstance lifecycle workers independently pause/suspend idle Actors.
+cleanup. Session lifecycle workers independently pause/suspend idle Actors.
 
 ## Component boundaries
 
 - API types describe agent behavior without exposing backend mechanics.
-- The v2 translator resolves references and compiles explicit runtime inputs.
+- The translator resolves references and compiles explicit runtime inputs.
 - The controller reconciles compiled revisions to ate-api ActorTemplates.
-- AgentInstance services and workflows own lifecycle orchestration.
+- Session and Sandbox services own their respective lifecycle orchestration.
+- The apiserver handles sandbox lifecycle and guest operations through one
+  Sandbox service.
 - The A2A gateway owns public authorization, task routing, and observation streams.
 - Runtime SDKs own execution and task saves; TaskStore owns durable publication.
 - The store owns transactional invariants and never performs network work.
@@ -70,27 +97,34 @@ cleanup. AgentInstance lifecycle workers independently pause/suspend idle Actors
 
 ## Documents
 
+- [Egress policies](egress-policies.md)
+- [Runtime credential injection](credential-injection.md)
 - [Configuration and compilation](configuration-and-compilation.md)
 - [Runtime and lifecycle](runtime-and-lifecycle.md)
+- [Client lifecycle retries](../lifecycle-retries.md)
+- [Standalone sandboxes](sandboxes.md)
 - [A2A gateway](a2a-gateway.md)
+- [A2A push notifications](a2a-push-notifications.md)
 - [A2A metadata](a2a-metadata.md)
+- [OIDC proxy authentication](oidc-proxy-authentication.md)
 - [Persistence, checkpoints, and forks](persistence-checkpoints-and-forks.md)
 - [MCP](mcp.md)
 - [A2A agent tools](a2a-subagents.md)
 - [Human in the loop](human-in-the-loop.md)
+- [Token usage](usage-extension.md)
 - [Prompt resolution](prompt-templates.md)
 - [Telemetry](telemetry.md)
 - [Structured output](structured-output.md)
 
-The documents describe implemented behavior. Full cross-AgentInstance delegation
+The documents describe implemented behavior. Full cross-Session delegation
 and Dedicated agents remain deferred.
 
 ## Current boundaries
 
 Implemented end to end: kagent, Codex, Claude, and BYO compilation; ate-api
-ActorTemplates; AgentInstance lifecycle; durable A2A tasks; auto-suspend;
+ActorTemplates; Session lifecycle; durable A2A tasks; auto-suspend;
 checkpoint/fork; and MCP Tasks continuation.
 
 Not implemented: Dedicated agent bindings, policy-enforced public
-cross-AgentInstance delegation, checkpoint sharing, and multi-replica gateway
+cross-Session delegation, checkpoint sharing, and multi-replica gateway
 coordination.

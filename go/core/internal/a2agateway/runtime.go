@@ -11,17 +11,19 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2aext"
 	a2agrpc "github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
-	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
-	"github.com/kagent-dev/kagent/go/core/internal/substrate"
-	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/kagent-dev/kagent/go/api/client"
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
+	"github.com/kagent-dev/kagent/go/core/internal/substrate"
+	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 )
 
 // RuntimeDialer connects public gateway calls to the single root Actor used by
-// the current v0 AgentInstance implementation. Replacing this component with a
+// the current v0 Session implementation. Replacing this component with a
 // member-store-backed dialer is sufficient when runtime topology becomes
 // explicit; the gateway handler does not depend on Actor naming or Atenet.
 type RuntimeDialer struct {
@@ -55,8 +57,8 @@ func NewRuntimeDialer(routerURL string, authenticator auth.AuthProvider) (*Runti
 	return &RuntimeDialer{target: router.Host, transport: transport, authenticator: authenticator}, nil
 }
 
-func (d *RuntimeDialer) Dial(ctx context.Context, instance *apiv1alpha1.AgentInstance) (*a2aclient.Client, error) {
-	targetActor, err := substrate.ActorTargetFromHost(instance.GetA2AAuthority())
+func (d *RuntimeDialer) Dial(ctx context.Context, session *apiv1.Session) (*a2aclient.Client, error) {
+	targetActor, err := substrate.ActorTargetFromHost(session.GetA2AAuthority())
 	if err != nil {
 		return nil, err
 	}
@@ -68,10 +70,11 @@ func (d *RuntimeDialer) Dial(ctx context.Context, instance *apiv1alpha1.AgentIns
 		a2agrpc.WithGRPCTransport(
 			grpc.WithTransportCredentials(d.transport),
 			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(client.DefaultGRPCMaxMessageSize), grpc.MaxCallSendMsgSize(client.DefaultGRPCMaxMessageSize)),
 		),
 		a2aclient.WithCallInterceptors(
 			a2aext.NewClientPropagator(nil),
-			&upstreamAuthInterceptor{authenticator: d.authenticator, instance: instance, targetActor: targetActor},
+			&upstreamAuthInterceptor{authenticator: d.authenticator, session: session, targetActor: targetActor},
 		),
 	)
 }
@@ -82,17 +85,17 @@ func (d *RuntimeDialer) Dial(ctx context.Context, instance *apiv1alpha1.AgentIns
 type upstreamAuthInterceptor struct {
 	a2aclient.PassthroughInterceptor
 	authenticator auth.AuthProvider
-	instance      *apiv1alpha1.AgentInstance
+	session       *apiv1.Session
 	targetActor   string
 }
 
 func (u *upstreamAuthInterceptor) Before(ctx context.Context, req *a2aclient.Request) (context.Context, any, error) {
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+req.BaseURL, nil)
+	httpRequest, err := http.NewRequestWithContext(auth.UpstreamMethodTo(ctx, req.Method), http.MethodPost, "http://"+req.BaseURL, nil)
 	if err != nil {
 		return ctx, nil, err
 	}
 	if session, ok := auth.AuthSessionFrom(ctx); ok {
-		principal := auth.Principal{Agent: auth.Agent{ID: u.instance.GetId()}}
+		principal := auth.Principal{Agent: auth.Agent{ID: u.session.GetId()}}
 		if err := u.authenticator.UpstreamAuth(httpRequest, session, principal); err != nil {
 			return ctx, nil, err
 		}

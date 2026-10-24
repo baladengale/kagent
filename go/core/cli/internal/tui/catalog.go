@@ -6,53 +6,48 @@ import (
 	"slices"
 	"strings"
 
-	clientset "github.com/kagent-dev/kagent/go/api/clientset/versioned"
-	commonk8s "github.com/kagent-dev/kagent/go/core/cli/internal/common/k8s"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
 )
 
-// catalog reads what could be run: Harness and AgentTemplate CRDs, the TUI's only kubeconfig need.
+// catalog reads what could be run: Agents.
 type catalog interface {
 	Namespaces(ctx context.Context) ([]namespaceCount, error)
-	Harnesses(ctx context.Context, namespace string) ([]string, error)
-	AgentTemplates(ctx context.Context, namespace string) ([]string, error)
+	Agents(ctx context.Context, namespace string) ([]string, error)
 }
 
-// namespaceCount is a namespace and how many AgentTemplates it holds.
+// namespaceCount is a namespace and how many Agents it holds.
 type namespaceCount struct {
-	Name      string
-	Templates int
+	Name   string
+	Agents int
 }
 
-// kubeCatalog reads the catalog through the generated clientset.
-type kubeCatalog struct {
-	clients clientset.Interface
+type agentLister interface {
+	ListAgents(context.Context, *apiv1.ListAgentsRequest) (*apiv1.ListAgentsResponse, error)
 }
 
-var _ catalog = (*kubeCatalog)(nil)
+// apiCatalog reads the catalog through the kagent API.
+type apiCatalog struct {
+	agents agentLister
+}
 
-// newKubeCatalog builds a catalog from the ambient kubeconfig; callers degrade to instance-derived panels.
-func newKubeCatalog() (catalog, error) {
-	clients, err := commonk8s.NewKagentClientset()
+var _ catalog = (*apiCatalog)(nil)
+
+// catalogPageSize is the largest page the API serves.
+const catalogPageSize = 100
+
+// Namespaces lists the namespaces holding Agents.
+func (c *apiCatalog) Namespaces(ctx context.Context) ([]namespaceCount, error) {
+	refs, err := c.list(ctx, "")
 	if err != nil {
-		return nil, err
-	}
-	return &kubeCatalog{clients: clients}, nil
-}
-
-// Namespaces lists namespaces holding AgentTemplates, which needs cluster-wide list permission.
-func (c *kubeCatalog) Namespaces(ctx context.Context) ([]namespaceCount, error) {
-	list, err := c.clients.ApiV1alpha3().AgentTemplates("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list AgentTemplates across namespaces: %w", err)
+		return nil, fmt.Errorf("list Agents across namespaces: %w", err)
 	}
 	counts := map[string]int{}
-	for i := range list.Items {
-		counts[list.Items[i].Namespace]++
+	for _, ref := range refs {
+		counts[ref.GetNamespace()]++
 	}
 	namespaces := make([]namespaceCount, 0, len(counts))
-	for name, templates := range counts {
-		namespaces = append(namespaces, namespaceCount{Name: name, Templates: templates})
+	for name, agents := range counts {
+		namespaces = append(namespaces, namespaceCount{Name: name, Agents: agents})
 	}
 	slices.SortFunc(namespaces, func(a, b namespaceCount) int {
 		return strings.Compare(a.Name, b.Name)
@@ -60,26 +55,35 @@ func (c *kubeCatalog) Namespaces(ctx context.Context) ([]namespaceCount, error) 
 	return namespaces, nil
 }
 
-func (c *kubeCatalog) Harnesses(ctx context.Context, namespace string) ([]string, error) {
-	list, err := c.clients.ApiV1alpha3().Harnesses(namespace).List(ctx, metav1.ListOptions{})
+func (c *apiCatalog) Agents(ctx context.Context, namespace string) ([]string, error) {
+	refs, err := c.list(ctx, namespace)
 	if err != nil {
-		return nil, fmt.Errorf("list Harnesses: %w", err)
+		return nil, fmt.Errorf("list Agents: %w", err)
 	}
-	names := make([]string, 0, len(list.Items))
-	for i := range list.Items {
-		names = append(names, list.Items[i].Name)
+	names := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		names = append(names, ref.GetName())
 	}
 	return names, nil
 }
 
-func (c *kubeCatalog) AgentTemplates(ctx context.Context, namespace string) ([]string, error) {
-	list, err := c.clients.ApiV1alpha3().AgentTemplates(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list AgentTemplates: %w", err)
+// list reads every page, so one response never has to hold the whole collection.
+func (c *apiCatalog) list(ctx context.Context, namespace string) ([]*apiv1.ResourceReference, error) {
+	var refs []*apiv1.ResourceReference
+	token := ""
+	for {
+		response, err := c.agents.ListAgents(ctx, &apiv1.ListAgentsRequest{
+			Namespace: namespace,
+			Page:      &apiv1.PageRequest{Limit: catalogPageSize, PageToken: token},
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, agent := range response.GetAgents() {
+			refs = append(refs, agent.GetRef())
+		}
+		if token = response.GetPage().GetNextPageToken(); token == "" {
+			return refs, nil
+		}
 	}
-	names := make([]string, 0, len(list.Items))
-	for i := range list.Items {
-		names = append(names, list.Items[i].Name)
-	}
-	return names, nil
 }

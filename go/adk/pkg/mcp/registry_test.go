@@ -7,13 +7,18 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/require"
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/kagent-dev/kagent/go/adk/pkg/auth"
 )
 
 func TestCreateTransportBuildsStdioCommand(t *testing.T) {
@@ -490,6 +495,35 @@ func TestPropagateToken_DoesNotForwardWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestPropagateTokenCarriesAuthenticatedOwner(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		ctx := auth.WithUserID(a2aCtx(map[string][]string{"X-User-Id": {"untrusted"}}), "alice")
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-User-Id")
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+		rt := &headerRoundTripper{base: newTestTransport(t), propagateToken: enabled}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := rt.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		want := ""
+		if enabled {
+			want = "alice"
+		}
+		if got != want {
+			t.Fatalf("propagateToken=%v: user = %q, want %q", enabled, got, want)
+		}
+	}
+}
+
 // TestAllowedRequestHeaders_ReturnsNilWhenNoMatches verifies that the helper returns
 // nil rather than an empty map when the allowed list has entries but none of them
 // appear in the request metadata.
@@ -578,5 +612,26 @@ func TestStaticHeaders_OverrideDynamic(t *testing.T) {
 
 	if capturedAuth != "Bearer static" {
 		t.Errorf("Authorization: got %q, want %q", capturedAuth, "Bearer static")
+	}
+}
+
+func TestCreateTransportPreservesFractionalTimeout(t *testing.T) {
+	for _, serverType := range []string{"http", "sse"} {
+		t.Run(serverType, func(t *testing.T) {
+			transport, err := createTransport(t.Context(), mcpServerParams{
+				ServerType:     serverType,
+				Timeout:        durationpb.New(250 * time.Millisecond),
+				SseReadTimeout: durationpb.New(750 * time.Millisecond),
+			})
+			require.NoError(t, err)
+			switch tr := transport.(type) {
+			case *mcpsdk.StreamableClientTransport:
+				require.Equal(t, 250*time.Millisecond, tr.HTTPClient.Timeout)
+			case *mcpsdk.SSEClientTransport:
+				require.Equal(t, 750*time.Millisecond, tr.HTTPClient.Timeout)
+			default:
+				t.Fatalf("unexpected transport %T", transport)
+			}
+		})
 	}
 }

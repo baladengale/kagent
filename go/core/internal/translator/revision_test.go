@@ -5,22 +5,23 @@ import (
 	"testing"
 
 	a2apb "github.com/a2aproject/a2a-go/v2/a2apb/v1"
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/stretchr/testify/require"
+	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
 func TestRevisionDigestIncludesSandboxClass(t *testing.T) {
-	revision := &Revision{Namespace: "agents", AgentTemplateName: "helper", HarnessName: "kagent"}
+	revision := &Revision{Namespace: "agents", AgentName: "helper"}
 	original, err := revision.Digest()
 	require.NoError(t, err)
-	require.Equal(t, "3edf8e1756778ce192e3c834e6ebd8e2421dc23e9d64ade7d6ee3c6d6897cd6d", original.String())
+	require.NotEqual(t, "563beefdd1b191baae375aa92e70bcab812a3c4fd2a189cdf74668f1ad45456d", original.String(),
+		"the default class must participate in the digest instead of preserving the legacy digest")
 
 	revision.SandboxClass = atev1alpha1.SandboxClassGvisor
 	gvisor, err := revision.Digest()
 	require.NoError(t, err)
-	require.Equal(t, original, gvisor, "explicit gVisor must preserve the existing default revision")
+	require.Equal(t, original, gvisor, "empty and explicit gVisor select the same runtime")
 	require.Equal(t, atev1alpha1.SandboxClassGvisor, revision.SandboxClass, "hashing must not mutate the revision")
 
 	revision.SandboxClass = atev1alpha1.SandboxClassMicroVM
@@ -37,8 +38,19 @@ func TestRevisionDigestIncludesSandboxClass(t *testing.T) {
 	require.True(t, invalid.IsZero())
 }
 
-func TestRevisionDigestIncludesProvenance(t *testing.T) {
-	revision := &Revision{Namespace: "agents", AgentTemplateName: "helper", HarnessName: "kagent", Provenance: []byte(`[{"kind":"ConfigMap","hash":"first"}]`)}
+func TestRevisionDigestReplacesNameOnlyWorkerPoolTemplate(t *testing.T) {
+	revision := &Revision{Namespace: "tenant-a", AgentName: "helper", WorkerPoolName: "kagent-default"}
+	id, err := revision.Digest()
+	require.NoError(t, err)
+	require.NotEqual(t, "01d0e398a0a585b884d12b7d9ae7924437ca21d6c44c7461ac869e396980a75e", id.String(),
+		"namespace-scoped placement must create a fresh immutable ActorTemplate")
+	repeated, err := revision.Digest()
+	require.NoError(t, err)
+	require.Equal(t, id, repeated)
+}
+
+func TestRevisionDigestExcludesProvenance(t *testing.T) {
+	revision := &Revision{Namespace: "agents", AgentName: "helper", Provenance: []byte(`[{"kind":"ConfigMap","hash":"first"}]`)}
 	first, err := revision.Digest()
 	if err != nil {
 		t.Fatal(err)
@@ -48,8 +60,8 @@ func TestRevisionDigestIncludesProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first == second {
-		t.Fatal("configuration change did not change runtime revision")
+	if first != second {
+		t.Fatal("source-only change altered runtime revision")
 	}
 	if len(first.Short()) != 12 || !strings.HasPrefix(first.String(), first.Short()) {
 		t.Fatalf("short revision %q is not a prefix of %q", first.Short(), first.String())
@@ -57,7 +69,7 @@ func TestRevisionDigestIncludesProvenance(t *testing.T) {
 }
 
 func TestRevisionDigestIncludesConfig(t *testing.T) {
-	revision := &Revision{Namespace: "agents", AgentTemplateName: "helper", HarnessName: "claude", ConfigJSON: []byte(`{"version":5,"runtime_telemetry":{"capture_content":false}}`)}
+	revision := &Revision{Namespace: "agents", AgentName: "helper", ConfigJSON: []byte(`{"version":5,"runtime_telemetry":{"capture_content":false}}`)}
 	first, err := revision.Digest()
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +85,7 @@ func TestRevisionDigestIncludesConfig(t *testing.T) {
 }
 
 func TestCompilationWarningsDoNotAffectRevisionDigest(t *testing.T) {
-	compilation := &CompileResult{Revision: Revision{Namespace: "agents", AgentTemplateName: "helper", HarnessName: "claude"}}
+	compilation := &CompileResult{Revision: Revision{Namespace: "agents", AgentName: "helper"}}
 	first, err := compilation.Digest()
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +104,7 @@ func TestCompilationWarningsDoNotAffectRevisionDigest(t *testing.T) {
 }
 
 func TestRevisionDigestIncludesCommand(t *testing.T) {
-	revision := &Revision{Namespace: "agents", AgentTemplateName: "helper", HarnessName: "byo", Command: []string{"/agent"}}
+	revision := &Revision{Namespace: "agents", AgentName: "helper", Command: []string{"/agent"}}
 	first, err := revision.Digest()
 	if err != nil {
 		t.Fatal(err)
@@ -130,4 +142,15 @@ func TestRevisionDigestIncludesBinaryAgentCard(t *testing.T) {
 	revision.AgentCard.Name = string([]byte{0xff})
 	_, err = revision.Digest()
 	require.Error(t, err)
+}
+
+func TestRevisionDigestIncludesResources(t *testing.T) {
+	revision := Revision{CPU: "1", Memory: "1Gi"}
+	before, err := revision.Digest()
+	require.NoError(t, err)
+	for _, changed := range []Revision{{CPU: "2", Memory: "1Gi"}, {CPU: "1", Memory: "2Gi"}} {
+		after, err := changed.Digest()
+		require.NoError(t, err)
+		require.NotEqual(t, before, after)
+	}
 }

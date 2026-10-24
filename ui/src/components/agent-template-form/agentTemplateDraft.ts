@@ -34,14 +34,13 @@ export interface McpToolDraft {
 }
 
 /** One sub-agent binding, flattened for a form to hold. */
-export interface AgentToolDraft {
+export interface SubAgentToolDraft {
   /** What the parent calls this tool. */
   name: string;
   /** When the parent should route work to it — the CRD requires this. */
   description: string;
-  /** The AgentTemplate it points at, by bare name in the same namespace. */
-  templateName: string;
-  isolation: "Shared" | "Dedicated";
+  /** The template's bare name in the same namespace. */
+  refName: string;
 }
 
 /** Where the system prompt comes from. The CRD rejects both at once. */
@@ -65,16 +64,10 @@ export interface AgentTemplateDraft {
   outputSchema: string;
   outputSchemaConfigMap: string;
   outputSchemaKey: string;
+  outputStrict: boolean;
   mcpTools: McpToolDraft[];
-  agentTools: AgentToolDraft[];
-  /**
-   * The labels admission is decided by.
-   *
-   * Not decoration: a `Harness` admits templates through a label selector, and the
-   * CRD says a harness with no selector admits none. A template whose labels match
-   * nothing reaches no prepared revision and can never become an agent — so this is
-   * the field that decides whether the template is usable at all.
-   */
+  subAgentTools: SubAgentToolDraft[];
+
   labels: { key: string; value: string }[];
 }
 
@@ -92,20 +85,31 @@ export function emptyDraft(namespace: string): AgentTemplateDraft {
     outputSchema: "",
     outputSchemaConfigMap: "",
     outputSchemaKey: "",
+    outputStrict: false,
     mcpTools: [],
-    agentTools: [],
+    subAgentTools: [],
     labels: [],
   };
 }
 
 /** The draft a form opens with when editing an existing template. */
 export function draftFromTemplate(template: AgentTemplate): AgentTemplateDraft {
-  const spec = template.resource.spec;
+  return {
+    ...draftFromSpec(template.resource.spec, template.namespace),
+    name: template.name,
+    labels: Object.entries(template.resource.metadata.labels ?? {}).map(
+      ([key, value]) => ({ key, value }),
+    ),
+  };
+}
+
+/** The draft for a bare spec, such as an Agent's inline template, which has no name or labels. */
+export function draftFromSpec(spec: AgentTemplateSpec, namespace: string): AgentTemplateDraft {
   const tools = spec.tools ?? [];
 
   return {
-    name: template.name,
-    namespace: template.namespace,
+    name: "",
+    namespace,
     modelConfig: spec.modelConfig?.name ?? "",
     description: spec.description ?? "",
     // Which one is in use is read from the resource rather than defaulted, so
@@ -125,6 +129,7 @@ export function draftFromTemplate(template: AgentTemplate): AgentTemplateDraft {
       : "",
     outputSchemaConfigMap: spec.outputSchemaFrom?.name ?? "",
     outputSchemaKey: spec.outputSchemaFrom?.key ?? "",
+    outputStrict: spec.outputSchemaStrict ?? false,
     mcpTools: tools
       .filter((binding) => binding.mcp)
       .map((binding) => ({
@@ -132,17 +137,14 @@ export function draftFromTemplate(template: AgentTemplate): AgentTemplateDraft {
         tools: [...(binding.mcp?.tools ?? [])],
         requireApproval: binding.mcp?.requireApproval,
       })),
-    agentTools: tools
-      .filter((binding) => binding.agent)
+    subAgentTools: tools
+      .filter((binding) => binding.subAgent)
       .map((binding) => ({
-        name: binding.agent?.name ?? "",
-        description: binding.agent?.description ?? "",
-        templateName: binding.agent?.templateRef.name ?? "",
-        isolation: binding.agent?.isolation ?? "Shared",
+        name: binding.subAgent?.name ?? "",
+        description: binding.subAgent?.description ?? "",
+        refName: binding.subAgent?.templateRef.name ?? "",
       })),
-    labels: Object.entries(template.resource.metadata.labels ?? {}).map(
-      ([key, value]) => ({ key, value }),
-    ),
+    labels: [],
   };
 }
 
@@ -171,16 +173,15 @@ export function specFromDraft(
           ...(tool.requireApproval ? { requireApproval: true } : {}),
         },
       })),
-    ...draft.agentTools
+    ...draft.subAgentTools
       .filter(
-        (tool) => tool.name.trim() !== "" && tool.templateName.trim() !== "",
+        (tool) => tool.name.trim() !== "" && tool.refName.trim() !== "",
       )
       .map((tool) => ({
-        agent: {
+        subAgent: {
           name: tool.name.trim(),
           description: tool.description.trim(),
-          templateRef: { name: tool.templateName.trim() },
-          isolation: tool.isolation,
+          templateRef: { name: tool.refName.trim() },
         },
       })),
   ];
@@ -214,13 +215,7 @@ export function specFromDraft(
     setOrDelete(spec, "systemPrompt", draft.systemPrompt.trim());
   }
 
-  /*
-   * Output sources have the same exactly-one shape as prompt sources, with one
-   * additional state: ordinary text output means neither schema field is present.
-   * Parsing happens here only after `draftProblems` has admitted the value. Keeping
-   * invalid JSON out of the resource also makes this function safe for callers that
-   * build a preview before enabling Save.
-   */
+
   if (draft.outputSource === "configMap") {
     delete spec.outputSchema;
     const name = draft.outputSchemaConfigMap.trim();
@@ -236,6 +231,8 @@ export function specFromDraft(
     delete spec.outputSchema;
     delete spec.outputSchemaFrom;
   }
+  if (draft.outputStrict && (spec.outputSchema || spec.outputSchemaFrom)) spec.outputSchemaStrict = true;
+  else delete spec.outputSchemaStrict;
 
   // An empty list is removed rather than sent: `tools: []` and no `tools` mean the
   // same thing to the controller, and the shorter resource is the one a reader can
@@ -305,7 +302,7 @@ export function draftProblems(
       }
     }
   }
-  for (const tool of draft.agentTools) {
+  for (const tool of draft.subAgentTools) {
     if (tool.name.trim() !== "" && tool.description.trim() === "") {
       problems.push(
         `The sub-agent tool "${tool.name.trim()}" needs a description — it is what tells the parent when to use it.`,

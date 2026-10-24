@@ -6,6 +6,9 @@ values.local.yaml
 
 test_results
 
+## Local planning documents
+/.plans/
+
 ### Go template
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
@@ -205,6 +208,7 @@ file::memory:*
 .DS_Store
 
 ## Helm
+/helm/kagent/files/builtin-harness-images.json
 *.tgz
 /tmp/
 /reports/*.csv
@@ -220,3 +224,6 @@ python/packages/kagent-adk/tests/fixtures/certs/*.srl
 
 ## Upgrade test: previous-release worktree (created by `make run-upgrade-tests`)
 .upgrade-prev/
+
+# Weaver live-check report
+/telemetry/conformance/report/

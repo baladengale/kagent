@@ -9,13 +9,14 @@ import (
 	"testing"
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
-	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
-	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	"github.com/kagent-dev/mockllm"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
+	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 )
 
 const claudeE2EHarness = "claude-e2e"
@@ -56,7 +57,7 @@ func TestE2EClaudeMockLocalSubagentRouting(t *testing.T) {
 	assertToolEvents(t, streamed.toolEvents, toolName)
 	persisted := getTask(t, fixture, streamed.taskID)
 	assertToolEvents(t, taskToolEvents(persisted), toolName)
-	assertNoClaudeChildInstance(t, fixture, childTemplate)
+	assertNoClaudeChildSession(t, fixture, childTemplate)
 	assertTaskHistory(t, fixture, streamed.taskID)
 }
 
@@ -130,7 +131,7 @@ func createClaudeLocalAgentTemplates(t *testing.T, kube ctrlclient.Client, model
 			SystemPrompt: childPrompt,
 		},
 	}
-	createAndWaitInteractionTemplateForHarness(t, kube, child, claudeE2EHarness)
+	createSharedTemplate(t, kube, child)
 	root := &v1alpha3.AgentTemplate{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "claude-local-root-", Namespace: "kagent",
@@ -140,10 +141,9 @@ func createClaudeLocalAgentTemplates(t *testing.T, kube ctrlclient.Client, model
 			ModelConfig:  &corev1.LocalObjectReference{Name: model.Name},
 			Description:  "Claude local-subagent E2E fixture",
 			SystemPrompt: "Always delegate the request to the specialist subagent, then return its answer.",
-			Tools: []v1alpha3.ToolBinding{{Agent: &v1alpha3.AgentToolBinding{
+			Tools: []v1alpha3.ToolBinding{{SubAgent: &v1alpha3.SubAgentToolBinding{
 				Name: "specialist", Description: "Handles every delegated specialist request",
-				TemplateRef: corev1.LocalObjectReference{Name: child.Name},
-				Isolation:   v1alpha3.AgentToolIsolationShared,
+				TemplateRef: &corev1.LocalObjectReference{Name: child.Name},
 			}}},
 		},
 	}
@@ -151,15 +151,15 @@ func createClaudeLocalAgentTemplates(t *testing.T, kube ctrlclient.Client, model
 	return root.Name, child.Name
 }
 
-func assertNoClaudeChildInstance(t *testing.T, fixture *interactionFixture, childTemplate string) {
+func assertNoClaudeChildSession(t *testing.T, fixture *interactionFixture, childTemplate string) {
 	t.Helper()
-	instances, err := fixture.instances.ListAgentInstances(fixture.ctx, &apiv1alpha1.ListAgentInstancesRequest{})
+	sessions, err := fixture.sessions.ListSessions(fixture.ctx, &apiv1.ListSessionsRequest{})
 	if err != nil {
-		t.Fatalf("list Claude AgentInstances: %v", err)
+		t.Fatalf("list Claude Sessions: %v", err)
 	}
-	for _, instance := range instances.GetAgentInstances() {
-		if instance.GetAgentTemplate().GetName() == childTemplate {
-			t.Fatalf("Claude local child created AgentInstance %q", instance.GetId())
+	for _, session := range sessions.GetSessions() {
+		if session.GetAgent().GetName() == childTemplate {
+			t.Fatalf("Claude local child created Session %q", session.GetId())
 		}
 	}
 }

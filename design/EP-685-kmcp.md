@@ -38,6 +38,9 @@ One EP corresponds to one "feature" or "enhancement" for its whole lifecycle. On
 -->
 # EP-685: First class support for kmcp
 
+Status: Superseded. Kagent v1 agents bind `RemoteMCPServer` resources and do not
+install or integrate KMCP. This document is retained as historical design context.
+
 <!--
 This is the title of your EP. Keep it short, simple, and descriptive. A good
 title can help communicate what the EP is and should be considered as part of
@@ -179,7 +182,7 @@ spec:
 
 The new `RemoteMCPServer` CRD would look like the following:
 ```
-apiVersion: kagent.dev/v1alpha3
+apiVersion: api.kagent.dev/v1alpha3
 kind: RemoteMCPServer
 metadata:
   name: my-remote-mcp-server

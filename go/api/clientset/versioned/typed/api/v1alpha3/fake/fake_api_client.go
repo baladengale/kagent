@@ -12,8 +12,16 @@ type FakeApiV1alpha3 struct {
 	*testing.Fake
 }
 
+func (c *FakeApiV1alpha3) Agents(namespace string) v1alpha3.AgentInterface {
+	return newFakeAgents(c, namespace)
+}
+
 func (c *FakeApiV1alpha3) AgentTemplates(namespace string) v1alpha3.AgentTemplateInterface {
 	return newFakeAgentTemplates(c, namespace)
+}
+
+func (c *FakeApiV1alpha3) EgressPolicies(namespace string) v1alpha3.EgressPolicyInterface {
+	return newFakeEgressPolicies(c, namespace)
 }
 
 func (c *FakeApiV1alpha3) Harnesses(namespace string) v1alpha3.HarnessInterface {
@@ -26,6 +34,10 @@ func (c *FakeApiV1alpha3) ModelConfigs(namespace string) v1alpha3.ModelConfigInt
 
 func (c *FakeApiV1alpha3) RemoteMCPServers(namespace string) v1alpha3.RemoteMCPServerInterface {
 	return newFakeRemoteMCPServers(c, namespace)
+}
+
+func (c *FakeApiV1alpha3) SandboxTemplates(namespace string) v1alpha3.SandboxTemplateInterface {
+	return newFakeSandboxTemplates(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate

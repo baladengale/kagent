@@ -2,9 +2,9 @@
  * A running agent, as the v1alpha3 runtime reports it.
  *
  * An `AgentInstance` is not a custom resource — it is a row in the controller's
- * own database, served by `AgentInstanceService` in
- * `proto/kagent/api/v1alpha1/agent_instances.proto` and implemented in
- * `go/core/v2/agentinstance`. So unlike agents, models and prompt libraries,
+ * own database, served by `SessionService` in
+ * `proto/kagent/api/v1/sessions.proto` and implemented in
+ * `go/core/internal/service/session`. So unlike agents, models and prompt libraries,
  * nothing here arrives inside a `StructuredObject`: the proto message *is* the
  * record, and these types mirror it field for field.
  *
@@ -21,19 +21,15 @@
  *
  * ## What "unspecified" means, and what it does not
  *
- * Proto3 gives every enum a zero value, and both of these use it. The controller
- * leaves `operation` at zero when no lifecycle operation is in flight, so
- * `"unspecified"` there reads as "nothing happening" — but that is the *controller's*
- * convention rather than something the wire distinguishes, and a record that was
- * never written would look identical. `state` at zero has no such convention: it
- * means the controller did not say. Both are rendered as their own thing on screen
- * rather than being folded into a plausible-looking default.
+ * The wire distinguishes an omitted operation (`UNSPECIFIED = 0`) from an
+ * explicit idle operation (`NONE`). This view model maps both to `"unspecified"`.
+ * State `UNSPECIFIED` means the controller did not report a lifecycle state.
  */
 
 /**
  * Where an instance is in its life.
  *
- * The six named values are `AgentInstanceState` in the proto, in its order.
+ * The six named values are `RuntimeState` in the proto, in its order.
  * `"unknown"` is this client's, for an enum member added after this build.
  */
 export type AgentInstanceState =
@@ -50,7 +46,7 @@ export type AgentInstanceState =
  * The lifecycle operation currently claimed on an instance, if any.
  *
  * The controller claims one before it acts and clears it when it finishes
- * (`claim`/`finish` in `go/core/v2/agentinstance/workflow.go`), so a non-`
+ * (`claim`/`finish` in `go/core/internal/service/agentinstance/workflow.go`), so a non-`
  * unspecified` value means something is in flight *right now* — and that a second
  * operation asked for meanwhile will be refused with `Aborted`.
  */
@@ -81,8 +77,7 @@ export interface AgentInstanceFailure {
  *
  * An instance owns one A2A context and an isolated history, so it holds exactly one
  * thread of turns and a second conversation with the same agent is a second
- * instance. The durable, runnable agent is the `(AgentTemplate, Harness)` pair it
- * was cut from — see `domain/agentPairs`.
+ * instance. The durable, runnable agent is the `Agent` it was started from.
  */
 export interface AgentInstance {
   /** A UUID. The controller rejects anything else — `validateIdentity` parses it. */
@@ -101,15 +96,8 @@ export interface AgentInstance {
   name: string;
   /** Who created it. Empty on a cluster with no authentication in front. */
   creator: string;
-  /** `namespace/name` of the Harness it runs, when the record carries one. */
-  harness?: string;
-  /**
-   * `namespace/name` of the AgentTemplate it was cut from.
-   *
-   * With the harness above, this is the agent: the pair is what `ListAgentInstances`
-   * narrows on, and what an agent's page is addressed by.
-   */
-  agentTemplate?: string;
+  /** `namespace/name` of the Agent it was created from, when recorded. */
+  agent?: string;
   /** The runtime revision this instance was prepared against. */
   preparedRevision?: string;
   /** Where its A2A endpoint is served, for a caller that wants to reach it. */
@@ -188,7 +176,7 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
 /**
  * Why the controller would refuse this name, or `undefined` if it would not.
  *
- * The controller's own rules (`validateName`, `go/core/v2/agentinstance/service.go`),
+ * The controller's own rules (`validateName`, `go/core/internal/service/agentinstance/service.go`),
  * copied rather than approximated, so a rename box can say no before the round trip
  * instead of turning an `InvalidArgument` into a red banner.
  *
@@ -214,22 +202,10 @@ export function conversationNameProblem(name: string): string | undefined {
   return undefined;
 }
 
-/**
- * What a share link over an AgentInstance allows.
- *
- * `readOnly` covers A2A get, list and subscribe; `readWrite` also allows send and
- * cancel. The controller stores these as `READ_ONLY` and `READ_WRITE` under a CHECK
- * constraint, and the interceptor treats anything that is not `READ_WRITE` as
- * read-only — so an unrecognised value is the safe one rather than the permissive
- * one.
- */
-export type AgentInstanceSharePermission = "readOnly" | "readWrite";
-
-/** One share link over one instance. The token itself is returned only on create. */
+/** One read-only share link over one instance. The token is returned only on create. */
 export interface AgentInstanceShare {
   id: string;
   agentInstanceId: string;
-  permission: AgentInstanceSharePermission;
   /** RFC3339, or empty when the record carried no timestamp. */
   createdAt: string;
 }
