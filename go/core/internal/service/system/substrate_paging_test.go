@@ -14,8 +14,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -31,7 +31,7 @@ import (
 )
 
 func pagingContext(t *testing.T) context.Context {
-	return pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{User: pkgAuth.User{ID: "user"}}})
+	return pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{ID: "user"}})
 }
 
 func pagingATEClient() *fakeATEClient {
@@ -215,7 +215,7 @@ func TestListSubstrateWorkersHidesATEAPIErrorText(t *testing.T) {
 
 func TestGetSubstrateSummaryHidesATEAPIWorkerErrorText(t *testing.T) {
 	scheme := runtime.NewScheme()
-	require.NoError(t, atev1alpha1.AddToScheme(scheme))
+	require.NoError(t, atev1.AddToScheme(scheme))
 	ateClient := &failingWorkersATEClient{fakeATEClient: *pagingATEClient()}
 	ateClient.workerErr = status.Error(codes.Internal, "worker u2-tenant-b is down")
 	service := system.NewService(fake.NewClientBuilder().WithScheme(scheme).Build(), []string{"tenant-a"}, &pkgAuth.NoopAuthorizer{}, ateClient)
@@ -444,7 +444,7 @@ func TestInventoryScanFollowsEmptyBackendPages(t *testing.T) {
 }
 
 func TestListSubstrateActors(t *testing.T) {
-	ctx := pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{User: pkgAuth.User{ID: "user"}}})
+	ctx := pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{ID: "user"}})
 
 	newService := func(client system.ATEClient) *system.Service {
 		return system.NewService(nil, nil, &pkgAuth.NoopAuthorizer{}, client)
@@ -521,7 +521,7 @@ func TestListSubstrateActors(t *testing.T) {
 }
 
 func TestListSubstrateWorkers(t *testing.T) {
-	ctx := pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{User: pkgAuth.User{ID: "user"}}})
+	ctx := pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{ID: "user"}})
 
 	ateClient := &fakeATEClient{pageSize: 2, workers: []*ateapipb.Worker{
 		{Metadata: &ateapipb.ResourceMetadata{Name: "worker-identity-0"}, WorkerNamespace: "team", WorkerPool: "pool", WorkerPod: "worker-0", Status: &ateapipb.WorkerStatus{Allocated: &ateapipb.WorkerResources{Actors: 2}}},
@@ -545,7 +545,7 @@ func TestListSubstrateWorkers(t *testing.T) {
 }
 
 func TestInventoryFiltersBeforePaging(t *testing.T) {
-	ctx := pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{User: pkgAuth.User{ID: "reader"}}})
+	ctx := pkgAuth.AuthSessionTo(t.Context(), &authimpl.SimpleSession{P: pkgAuth.Principal{ID: "reader"}})
 	ate := &fakeATEClient{pageSize: 1, actors: []*ateapipb.Actor{substrateActor("hidden", "team", 0, "", ""), substrateActor("visible", "team", 0, "", "")}, workers: []*ateapipb.Worker{{Metadata: &ateapipb.ResourceMetadata{Name: "hidden"}, WorkerNamespace: "workers"}, {Metadata: &ateapipb.ResourceMetadata{Name: "visible"}, WorkerNamespace: "workers"}}}
 	policy := inventoryAuthorizer{scopes: map[string]apiauthorization.AuthorizationScope{
 		"SubstrateActor":  inventoryScope(apiauthorization.AttributeAtespace, "team", "visible"),
@@ -846,7 +846,7 @@ func TestSubstrateSummaryHidesBackendErrorDetails(t *testing.T) {
 	} {
 		t.Run(status.Code(backendErr).String(), func(t *testing.T) {
 			scheme := runtime.NewScheme()
-			require.NoError(t, atev1alpha1.AddToScheme(scheme))
+			require.NoError(t, atev1.AddToScheme(scheme))
 			kube := fake.NewClientBuilder().WithScheme(scheme).Build()
 			svc := system.NewService(kube, nil, &pkgAuth.NoopAuthorizer{}, &fakeATEClient{err: backendErr})
 			result, err := svc.GetSubstrateSummary(pagingContext(t), "", "")

@@ -11,7 +11,7 @@ import (
 	guestpb "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -79,7 +79,7 @@ func TestSandboxExpirationRejectsInvalidInterval(t *testing.T) {
 type testSession string
 
 func (s testSession) Principal() auth.Principal {
-	return auth.Principal{User: auth.User{ID: string(s)}}
+	return auth.Principal{ID: string(s)}
 }
 
 type testActors struct {
